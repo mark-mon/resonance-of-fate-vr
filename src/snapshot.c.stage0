@@ -1,0 +1,339 @@
+// SO4 VR - stage 0: xinput1_3 proxy + memory snapshot + D3D11 vtable discovery.
+#define WIN32_LEAN_AND_MEAN
+#define COBJMACROS
+#include <windows.h>
+#include <psapi.h>
+#include <d3d11_1.h>
+#include <dxgi.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+
+#define SO4VR_VERSION "0.0.2-snapshot"
+
+static char g_dir[MAX_PATH];
+static HANDLE g_log = INVALID_HANDLE_VALUE;
+static CRITICAL_SECTION g_logcs;
+static HMODULE g_real;
+static volatile LONG g_getstate_calls;
+static LARGE_INTEGER g_qpf, g_qp0;
+
+static void logf(const char* fmt, ...) {
+    char buf[2048]; int n;
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    double s = (double)(t.QuadPart - g_qp0.QuadPart) / (double)g_qpf.QuadPart;
+    n = _snprintf_s(buf, sizeof buf, _TRUNCATE, "[%9.3f t%05lu] ", s, GetCurrentThreadId());
+    va_list ap; va_start(ap, fmt);
+    int m = _vsnprintf_s(buf + n, sizeof buf - n - 2, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (m < 0) m = (int)strlen(buf + n);
+    n += m; buf[n++] = '\r'; buf[n++] = '\n';
+    EnterCriticalSection(&g_logcs);
+    DWORD w; if (g_log != INVALID_HANDLE_VALUE) WriteFile(g_log, buf, n, &w, NULL);
+    LeaveCriticalSection(&g_logcs);
+}
+
+static void path_in_dir(char* out, const char* name) { _snprintf_s(out, MAX_PATH, _TRUNCATE, "%s\\%s", g_dir, name); }
+
+// ---------------------------------------------------------------- config.txt (Key = Value)
+static int cfg_int(const char* key, int def) {
+    char p[MAX_PATH]; path_in_dir(p, "config.txt");
+    FILE* f = NULL; if (fopen_s(&f, p, "rb") || !f) return def;
+    char line[512]; int v = def; size_t kl = strlen(key);
+    while (fgets(line, sizeof line, f)) {
+        char* s = line; while (*s == ' ' || *s == '\t') s++;
+        if (_strnicmp(s, key, kl) == 0) {
+            char* e = s + kl; while (*e == ' ' || *e == '\t') e++;
+            if (*e == '=') { v = atoi(e + 1); }
+        }
+    }
+    fclose(f); return v;
+}
+
+// ---------------------------------------------------------------- xinput forwarding
+typedef DWORD (WINAPI *PFN_GetState)(DWORD, void*);
+typedef DWORD (WINAPI *PFN_SetState)(DWORD, void*);
+typedef DWORD (WINAPI *PFN_GetCaps)(DWORD, DWORD, void*);
+typedef void  (WINAPI *PFN_Enable)(BOOL);
+typedef DWORD (WINAPI *PFN_GetDSound)(DWORD, GUID*, GUID*);
+typedef DWORD (WINAPI *PFN_GetBattery)(DWORD, BYTE, void*);
+typedef DWORD (WINAPI *PFN_GetKeystroke)(DWORD, DWORD, void*);
+typedef DWORD (WINAPI *PFN_Wait)(DWORD, DWORD, void*);
+typedef DWORD (WINAPI *PFN_Idx)(DWORD);
+static PFN_GetState r_GetState, r_GetStateEx; static PFN_SetState r_SetState; static PFN_GetCaps r_GetCaps;
+static PFN_Enable r_Enable; static PFN_GetDSound r_GetDSound; static PFN_GetBattery r_GetBattery;
+static PFN_GetKeystroke r_GetKeystroke; static PFN_Wait r_Wait; static PFN_Idx r_Cancel, r_PowerOff;
+
+static void load_real(void) {
+    if (g_real) return;
+    char sys[MAX_PATH]; GetSystemDirectoryA(sys, MAX_PATH);
+    char p[MAX_PATH]; _snprintf_s(p, MAX_PATH, _TRUNCATE, "%s\\xinput1_3.dll", sys);
+    g_real = LoadLibraryA(p);
+    if (!g_real) { _snprintf_s(p, MAX_PATH, _TRUNCATE, "%s\\xinput1_4.dll", sys); g_real = LoadLibraryA(p); }
+    if (!g_real) return;
+    r_GetState = (PFN_GetState)GetProcAddress(g_real, "XInputGetState");
+    r_SetState = (PFN_SetState)GetProcAddress(g_real, "XInputSetState");
+    r_GetCaps = (PFN_GetCaps)GetProcAddress(g_real, "XInputGetCapabilities");
+    r_Enable = (PFN_Enable)GetProcAddress(g_real, "XInputEnable");
+    r_GetDSound = (PFN_GetDSound)GetProcAddress(g_real, "XInputGetDSoundAudioDeviceGuids");
+    r_GetBattery = (PFN_GetBattery)GetProcAddress(g_real, "XInputGetBatteryInformation");
+    r_GetKeystroke = (PFN_GetKeystroke)GetProcAddress(g_real, "XInputGetKeystroke");
+    r_GetStateEx = (PFN_GetState)GetProcAddress(g_real, (LPCSTR)100);
+    r_Wait = (PFN_Wait)GetProcAddress(g_real, (LPCSTR)101);
+    r_Cancel = (PFN_Idx)GetProcAddress(g_real, (LPCSTR)102);
+    r_PowerOff = (PFN_Idx)GetProcAddress(g_real, (LPCSTR)103);
+}
+#define NC ERROR_DEVICE_NOT_CONNECTED
+__declspec(dllexport) DWORD WINAPI XInputGetState(DWORD i, void* s) { InterlockedIncrement(&g_getstate_calls); return r_GetState ? r_GetState(i, s) : NC; }
+__declspec(dllexport) DWORD WINAPI XInputSetState(DWORD i, void* v) { return r_SetState ? r_SetState(i, v) : NC; }
+__declspec(dllexport) DWORD WINAPI XInputGetCapabilities(DWORD i, DWORD f, void* c) { return r_GetCaps ? r_GetCaps(i, f, c) : NC; }
+__declspec(dllexport) void  WINAPI XInputEnable(BOOL e) { if (r_Enable) r_Enable(e); }
+__declspec(dllexport) DWORD WINAPI XInputGetDSoundAudioDeviceGuids(DWORD i, GUID* a, GUID* b) { return r_GetDSound ? r_GetDSound(i, a, b) : NC; }
+__declspec(dllexport) DWORD WINAPI XInputGetBatteryInformation(DWORD i, BYTE t, void* b) { return r_GetBattery ? r_GetBattery(i, t, b) : NC; }
+__declspec(dllexport) DWORD WINAPI XInputGetKeystroke(DWORD i, DWORD r, void* k) { return r_GetKeystroke ? r_GetKeystroke(i, r, k) : NC; }
+__declspec(dllexport) DWORD WINAPI XInputGetStateEx(DWORD i, void* s) { InterlockedIncrement(&g_getstate_calls); return r_GetStateEx ? r_GetStateEx(i, s) : (r_GetState ? r_GetState(i, s) : NC); }
+__declspec(dllexport) DWORD WINAPI XInputWaitForGuideButton(DWORD i, DWORD f, void* l) { return r_Wait ? r_Wait(i, f, l) : NC; }
+__declspec(dllexport) DWORD WINAPI XInputCancelGuideButtonWait(DWORD i) { return r_Cancel ? r_Cancel(i) : NC; }
+__declspec(dllexport) DWORD WINAPI XInputPowerOffController(DWORD i) { return r_PowerOff ? r_PowerOff(i) : NC; }
+
+// ---------------------------------------------------------------- safe memory
+static int readable(DWORD prot) {
+    if (prot & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
+    return (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+// Page-validity cache so a scan does not call VirtualQuery for every qword.
+static ULONG_PTR g_ok_lo, g_ok_hi, g_bad_lo, g_bad_hi;
+static int ptr_ok(ULONG_PTR a, SIZE_T n) {
+    if (a >= g_ok_lo && a + n <= g_ok_hi) return 1;
+    if (a >= g_bad_lo && a < g_bad_hi) return 0;
+    MEMORY_BASIC_INFORMATION m;
+    if (!VirtualQuery((void*)a, &m, sizeof m)) return 0;
+    ULONG_PTR lo = (ULONG_PTR)m.BaseAddress, hi = lo + m.RegionSize;
+    if (m.State == MEM_COMMIT && readable(m.Protect)) { g_ok_lo = lo; g_ok_hi = hi; return a + n <= hi; }
+    g_bad_lo = lo; g_bad_hi = hi; return 0;
+}
+static int safe_read_ptr(const void* p, void** out) {
+    if (!ptr_ok((ULONG_PTR)p, 8)) return 0;
+    __try { *out = *(void* const*)p; return 1; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// ---------------------------------------------------------------- module list
+static void log_modules(const char* fname) {
+    HMODULE mods[1024]; DWORD need = 0;
+    char p[MAX_PATH]; path_in_dir(p, fname);
+    FILE* f = NULL; fopen_s(&f, p, "wb");
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &need)) { if (f) fclose(f); return; }
+    int n = (int)(need / sizeof(HMODULE));
+    for (int i = 0; i < n; i++) {
+        MODULEINFO mi; char name[MAX_PATH] = {0};
+        GetModuleInformation(GetCurrentProcess(), mods[i], &mi, sizeof mi);
+        GetModuleFileNameA(mods[i], name, MAX_PATH);
+        if (f) fprintf(f, "%016llx %08lx %s\r\n", (unsigned long long)(ULONG_PTR)mi.lpBaseOfDll, mi.SizeOfImage, name);
+    }
+    if (f) fclose(f);
+    logf("modules: %d written to %s", n, fname);
+}
+
+// ---------------------------------------------------------------- D3D11 vtables via a private device
+static void* g_vt_dev, *g_vt_ctx, *g_vt_sc, *g_vt_dev1;
+static void* g_fn_create_dev, *g_fn_create_dev_sc;
+
+static void discover_vtables(void) {
+    HMODULE d3d = LoadLibraryA("d3d11.dll");
+    if (!d3d) { logf("d3d11.dll not loadable"); return; }
+    g_fn_create_dev = (void*)GetProcAddress(d3d, "D3D11CreateDevice");
+    g_fn_create_dev_sc = (void*)GetProcAddress(d3d, "D3D11CreateDeviceAndSwapChain");
+    PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN create = (PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN)g_fn_create_dev_sc;
+    HWND hw = CreateWindowExA(0, "STATIC", "so4vr_probe", WS_POPUP, 0, 0, 64, 64, NULL, NULL, NULL, NULL);
+    DXGI_SWAP_CHAIN_DESC sd; memset(&sd, 0, sizeof sd);
+    sd.BufferCount = 1; sd.BufferDesc.Width = 64; sd.BufferDesc.Height = 64;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hw; sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    ID3D11Device* dev = NULL; ID3D11DeviceContext* ctx = NULL; IDXGISwapChain* sc = NULL; D3D_FEATURE_LEVEL fl;
+    HRESULT hr = create(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &sd, &sc, &dev, &fl, &ctx);
+    logf("probe device hr=%08lx fl=%x", hr, fl);
+    if (SUCCEEDED(hr)) {
+        g_vt_dev = *(void**)dev; g_vt_ctx = *(void**)ctx; g_vt_sc = *(void**)sc;
+        void** vd = (void**)g_vt_dev, **vc = (void**)g_vt_ctx, **vs = (void**)g_vt_sc;
+        logf("vtable ID3D11Device %p  ID3D11DeviceContext %p  IDXGISwapChain %p", g_vt_dev, g_vt_ctx, g_vt_sc);
+        logf("  Device::CreateTexture2D[5]=%p CreateBuffer[3]=%p", vd[5], vd[3]);
+        logf("  Ctx::DrawIndexed[12]=%p Draw[13]=%p Map[14]=%p VSSetConstantBuffers[7]=%p UpdateSubresource[48]=%p OMSetRenderTargets[33]=%p",
+             vc[12], vc[13], vc[14], vc[7], vc[48], vc[33]);
+        logf("  SwapChain::Present[8]=%p ResizeBuffers[13]=%p", vs[8], vs[13]);
+        ID3D11Device1* d1 = NULL;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(dev, &IID_ID3D11Device1, (void**)&d1)) && d1) { g_vt_dev1 = *(void**)d1; ID3D11Device1_Release(d1); }
+        IDXGISwapChain_Release(sc); ID3D11DeviceContext_Release(ctx); ID3D11Device_Release(dev);
+    }
+    DestroyWindow(hw);
+    logf("D3D11CreateDevice=%p D3D11CreateDeviceAndSwapChain=%p d3d11 base=%p", g_fn_create_dev, g_fn_create_dev_sc, d3d);
+}
+
+// Scan the main image's readable memory for qwords pointing to objects with a known vtable.
+static void scan_globals(BYTE* base, SIZE_T size) {
+    struct { void* vt; const char* name; int hits; } T[4] = { {g_vt_dev,"ID3D11Device",0},{g_vt_ctx,"ID3D11DeviceContext",0},{g_vt_sc,"IDXGISwapChain",0},{g_vt_dev1,"ID3D11Device1",0} };
+    BYTE* p = base; MEMORY_BASIC_INFORMATION mbi;
+    while (p < base + size && VirtualQuery(p, &mbi, sizeof mbi)) {
+        BYTE* rs = (BYTE*)mbi.BaseAddress; BYTE* re = rs + mbi.RegionSize; if (re > base + size) re = base + size;
+        if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) && !(mbi.Protect & PAGE_GUARD)) {
+            for (BYTE* q = rs; q + 8 <= re; q += 8) {
+                ULONG_PTR v = *(ULONG_PTR*)q;
+                if (v < 0x10000 || v > 0x7FFFFFFFFFFFull || (v & 7)) continue;
+                void* vt; if (!safe_read_ptr((void*)v, &vt)) continue;
+                for (int k = 0; k < 4; k++) if (T[k].vt && vt == T[k].vt && T[k].hits < 32) {
+                    T[k].hits++; logf("global %s: rva %08llx -> obj %p (prot %lx)", T[k].name, (unsigned long long)(q - base), (void*)v, mbi.Protect);
+                }
+            }
+        }
+        p = re;
+    }
+    for (int k = 0; k < 4; k++) logf("scan %s: %d hits", T[k].name, T[k].hits);
+}
+
+// ---------------------------------------------------------------- known game globals (from dump 003)
+#define RVA_RENDERER 0xf76c70   // CRenderer* (device creation func 0x1400532c0)
+#define OFF_DEVICE   0x24a9b8
+#define OFF_FACTORY  0x24a9c0
+#define OFF_SWAPCHAIN 0x24a9c8
+#define OFF_SCDESC   0x24a9d0
+static void probe_renderer(void) {
+    BYTE* base = (BYTE*)GetModuleHandleA(NULL);
+    void* r = NULL; safe_read_ptr(base + RVA_RENDERER, &r);
+    logf("renderer global %p -> %p", base + RVA_RENDERER, r);
+    if (!r) return;
+    void *dev = NULL, *fac = NULL, *sc = NULL, *vdev = NULL, *vsc = NULL;
+    safe_read_ptr((BYTE*)r + OFF_DEVICE, &dev); safe_read_ptr((BYTE*)r + OFF_FACTORY, &fac); safe_read_ptr((BYTE*)r + OFF_SWAPCHAIN, &sc);
+    if (dev) safe_read_ptr(dev, &vdev);
+    if (sc) safe_read_ptr(sc, &vsc);
+    logf("  device %p (vt %p %s)  factory %p  swapchain %p (vt %p %s)", dev, vdev, vdev == g_vt_dev ? "OK" : "??", fac, sc, vsc, vsc == g_vt_sc ? "OK" : "??");
+    if (sc && vsc == g_vt_sc) {
+        DXGI_SWAP_CHAIN_DESC d; memset(&d, 0, sizeof d);
+        if (SUCCEEDED(IDXGISwapChain_GetDesc((IDXGISwapChain*)sc, &d)))
+            logf("  swapchain %ux%u fmt %d buffers %u windowed %d effect %d flags %x", d.BufferDesc.Width, d.BufferDesc.Height, d.BufferDesc.Format, d.BufferCount, d.Windowed, d.SwapEffect, d.Flags);
+        ID3D11Device* dv = NULL;
+        if (SUCCEEDED(IDXGISwapChain_GetDevice((IDXGISwapChain*)sc, &IID_ID3D11Device, (void**)&dv)) && dv) {
+            ID3D11DeviceContext* ctx = NULL; ID3D11Device_GetImmediateContext(dv, &ctx);
+            logf("  swapchain device %p, immediate context %p (vt %p)", dv, ctx, ctx ? *(void**)ctx : NULL);
+            if (ctx) ID3D11DeviceContext_Release(ctx);
+            ID3D11Device_Release(dv);
+        }
+    }
+    // dump the renderer object's first 0x300 bytes around the device block for later analysis
+    char p[MAX_PATH]; path_in_dir(p, "so4_renderer.bin");
+    HANDLE h = CreateFileA(p, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        BYTE* q = (BYTE*)r; SIZE_T total = OFF_SCDESC + 0x1000; DWORD w;
+        for (SIZE_T o = 0; o < total; o += 0x1000) {
+            static BYTE zero[0x1000];
+            WriteFile(h, ptr_ok((ULONG_PTR)(q + o), 0x1000) ? q + o : zero, 0x1000, &w, NULL);
+        }
+        CloseHandle(h);
+        logf("  renderer object 0x%llx bytes saved to so4_renderer.bin", (unsigned long long)total);
+    }
+}
+
+// ---------------------------------------------------------------- image dump
+static void dump_image(int idx) {
+    BYTE* base = (BYTE*)GetModuleHandleA(NULL);
+    MEMORY_BASIC_INFORMATION mbi; BYTE* p = base; SIZE_T end = 0;
+    while (VirtualQuery(p, &mbi, sizeof mbi) && mbi.AllocationBase == base) { p = (BYTE*)mbi.BaseAddress + mbi.RegionSize; }
+    end = (SIZE_T)(p - base);
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base; SIZE_T hdrsize = 0;
+    IMAGE_NT_HEADERS64* nt = NULL;
+    if (dos->e_magic == IMAGE_DOS_SIGNATURE) { nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew); if (nt->Signature == IMAGE_NT_SIGNATURE) hdrsize = nt->OptionalHeader.SizeOfImage; else nt = NULL; }
+    logf("dump %d: base %p, allocation span %llx, header SizeOfImage %llx", idx, base, (unsigned long long)end, (unsigned long long)hdrsize);
+
+    char bin[MAX_PATH], txt[MAX_PATH], nm[64];
+    _snprintf_s(nm, sizeof nm, _TRUNCATE, "so4_dump%d.bin", idx); path_in_dir(bin, nm);
+    _snprintf_s(nm, sizeof nm, _TRUNCATE, "so4_dump%d.txt", idx); path_in_dir(txt, nm);
+    HANDLE hb = CreateFileA(bin, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+    FILE* ft = NULL; fopen_s(&ft, txt, "wb");
+    if (ft) {
+        fprintf(ft, "base %p\r\nspan %llx\r\nsizeofimage %llx\r\n", base, (unsigned long long)end, (unsigned long long)hdrsize);
+        if (nt) {
+            fprintf(ft, "entry %08lx imagebase %llx\r\n", nt->OptionalHeader.AddressOfEntryPoint, (unsigned long long)nt->OptionalHeader.ImageBase);
+            IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
+            for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+                fprintf(ft, "section %-8.8s va %08lx vsize %08lx raw %08lx chr %08lx\r\n", s[i].Name, s[i].VirtualAddress, s[i].Misc.VirtualSize, s[i].SizeOfRawData, s[i].Characteristics);
+        }
+        fprintf(ft, "vt_device %p\r\nvt_context %p\r\nvt_swapchain %p\r\nvt_device1 %p\r\nfn_D3D11CreateDevice %p\r\nfn_D3D11CreateDeviceAndSwapChain %p\r\n",
+                g_vt_dev, g_vt_ctx, g_vt_sc, g_vt_dev1, g_fn_create_dev, g_fn_create_dev_sc);
+    }
+    static BYTE zero[65536];
+    p = base; SIZE_T written = 0, unread = 0;
+    while (p < base + end && VirtualQuery(p, &mbi, sizeof mbi)) {
+        BYTE* rs = (BYTE*)mbi.BaseAddress; SIZE_T rsz = mbi.RegionSize;
+        int ok = mbi.State == MEM_COMMIT && readable(mbi.Protect);
+        if (ft) fprintf(ft, "region %08llx %08llx state %lx prot %lx%s\r\n", (unsigned long long)(rs - base), (unsigned long long)rsz, mbi.State, mbi.Protect, ok ? "" : " (zeroed)");
+        for (SIZE_T off = 0; off < rsz; off += 65536) {
+            SIZE_T n = rsz - off < 65536 ? rsz - off : 65536; DWORD w;
+            const void* src = zero;
+            if (ok) src = rs + off;
+            if (!WriteFile(hb, src, (DWORD)n, &w, NULL)) { // a page may have changed protection; write zeros
+                WriteFile(hb, zero, (DWORD)n, &w, NULL);
+            }
+            written += n; if (!ok) unread += n;
+        }
+        p = rs + rsz;
+    }
+    CloseHandle(hb); if (ft) fclose(ft);
+    logf("dump %d: wrote %llu bytes (%llu zeroed) to %s", idx, (unsigned long long)written, (unsigned long long)unread, bin);
+    scan_globals(base, end);
+}
+
+static BOOL CALLBACK enum_win(HWND h, LPARAM lp) {
+    DWORD pid; GetWindowThreadProcessId(h, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(h)) {
+        char t[256] = {0}, c[128] = {0}; RECT r; GetClientRect(h, &r);
+        GetWindowTextA(h, t, sizeof t); GetClassNameA(h, c, sizeof c);
+        logf("window %p class '%s' title '%s' client %ldx%ld", h, c, t, r.right, r.bottom);
+    }
+    return TRUE;
+}
+
+// ---------------------------------------------------------------- worker
+static DWORD WINAPI worker(LPVOID unused) {
+    (void)unused;
+    int autoSec = cfg_int("DumpAfterSec", 300);
+    logf("worker: DumpAfterSec=%d; dump on request file so4_dump_now.txt", autoSec);
+    DWORD t0 = GetTickCount(); int idx = 0, vt_done = 0, last_report = 0;
+    char req[MAX_PATH]; path_in_dir(req, "so4_dump_now.txt");
+    for (;;) {
+        Sleep(500);
+        int sec = (int)((GetTickCount() - t0) / 1000);
+        if (sec / 15 != last_report) {
+            last_report = sec / 15;
+            logf("alive %ds, XInputGetState calls %ld, d3d11 %p dxgi %p", sec, g_getstate_calls, GetModuleHandleA("d3d11.dll"), GetModuleHandleA("dxgi.dll"));
+        }
+        int want = GetFileAttributesA(req) != INVALID_FILE_ATTRIBUTES;
+        if (!want && autoSec > 0 && idx == 0 && sec >= autoSec) want = 1;
+        if (want) {
+            DeleteFileA(req);
+            if (!vt_done) { discover_vtables(); vt_done = 1; }
+            probe_renderer();
+            EnumWindows(enum_win, 0);
+            char mn[64]; _snprintf_s(mn, sizeof mn, _TRUNCATE, "so4_modules%d.txt", idx); log_modules(mn);
+            dump_image(idx);
+            char done[MAX_PATH]; path_in_dir(done, "so4_dump_done.txt");
+            FILE* f = NULL; if (!fopen_s(&f, done, "wb") && f) { fprintf(f, "%d\r\n", idx); fclose(f); }
+            idx++;
+        }
+    }
+}
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
+    (void)r;
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(h);
+        QueryPerformanceFrequency(&g_qpf); QueryPerformanceCounter(&g_qp0);
+        InitializeCriticalSection(&g_logcs);
+        GetModuleFileNameA(NULL, g_dir, MAX_PATH);
+        char* s = strrchr(g_dir, '\\'); if (s) *s = 0;
+        char lp[MAX_PATH]; path_in_dir(lp, "so4vr.log");
+        g_log = CreateFileA(lp, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        load_real();
+        char exe[MAX_PATH]; GetModuleFileNameA(NULL, exe, MAX_PATH);
+        logf("so4vr %s loaded into %s (base %p), real xinput %p", SO4VR_VERSION, exe, GetModuleHandleA(NULL), g_real);
+        CreateThread(NULL, 0, worker, NULL, 0, NULL);
+    }
+    return TRUE;
+}

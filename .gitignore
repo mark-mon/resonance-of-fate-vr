@@ -1,0 +1,13 @@
+build/
+work/
+snap/
+snap_src/
+__pycache__/
+*.obj
+*.pdb
+*.dll
+*.exe
+*.bin
+*.pkl
+*.log
+*.bmp

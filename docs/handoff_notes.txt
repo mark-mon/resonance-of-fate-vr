@@ -1,0 +1,71 @@
+RESONANCE OF FATE (4K/HD Edition) - NATIVE VR MOD (rofvr)
+Handoff notes for a new chat. Updated 2026-10-28 (builds 0.0.1 - 1.0.0, initial release).
+=====================================================================================================
+
+STATUS
+------
+- Working: flat virtual screen, head tracking, TRUE NATIVE STEREO (each eye rendered by the game with its own
+  camera, both eyes replayed from the render queue - no AER, no mono), HUD on its own OpenXR layer (matte),
+  render resolution at headset size (Auto, 16:9 at the recommended height), in-headset settings menu (vrkit,
+  Insert / L3+R3), motion blur off in VR, sharpening, foveated rendering (VRS; per-eye fix in 0.1.3).
+- Measured on the test PC (RTX 3080 Ti, SteamVR null headset): 57-60 fps stereo at 1280x720 per eye,
+  42-60 fps at 4808x2704 per eye while walking; 3-minute soak clean (no crash, glitch detector silent).
+- Not yet seen in VR on the Pimax (needs the user), not yet tested: battles, world map, cutscenes, TAA options
+  (TAA addresses not mapped; the menu hides them).
+
+QUICK START FOR THE NEXT CHAT
+-----------------------------
+1. Connect: D:\vrconversions\resonanceoffate (this folder), D:\vrconversions\sharedtools,
+   D:\SteamLibrary\steamapps\common\Resonance of Fate, and read-only D:\vrconversions\starocean4 (closest project).
+2. The user starts the agent: D:\vrconversions\resonanceoffate\agent.cmd (agent\agent.ps1, helpers agent\tools\rof.ps1).
+3. Source: rofvr_src_1.0.0.tgz in this folder (also rofvr\ in the container of the previous chat - gone).
+   Unpack, run scripts/setup_env.sh <toolchain64bit.zip>, then scripts/build.sh -> build/xinput1_3.dll.
+4. FINDINGS.md in the source has every address and what each test showed. Read it first.
+
+HOW THE MOD IS BUILT
+--------------------
+- Based on the Star Ocean: The Last Hope mod (so4vr 0.3.7). RoF is the same ASKA engine generation: the render
+  thread command processor, job dispatch, per-view constant blocks, camera object and screen config are the same
+  code with shifted offsets. Game-specific files keep their so4_* names (so4_stereo.cpp, so4_camera.cpp,
+  so4_headtrack.cpp, so4_hud.cpp, render_res.cpp); addresses were remapped (see FINDINGS.md).
+- New in rofvr: dllmain.cpp DeferredGameHooks (game-code hooks wait until SteamStub has decrypted .text AND the
+  page is executable again - hooking in DllMain fails), rof_input.cpp (pad object diagnostics), PatchAligned
+  (constant-upload matrix scan only at 16-byte positions: 30 -> 60 fps), VRS eye selection for both-replay stereo.
+- RE tooling (re/): rebuild_pe.py (memory dump -> PE), index.py + q.py (xref index), match.py / findmatch.py /
+  side.py (match SO4 functions to RoF by code shape, side-by-side disassembly), dispfind.py / dispany.py,
+  rtti_rof.py / rtti_so4.py, vtmatch.py. Dumps: agent\captures\002\rof_dump0.bin (RoF),
+  D:\vrconversions\starocean4\agent\captures\003\so4_dump0.bin (SO4).
+
+TEST AUTOMATION (agent\tools\rof.ps1)
+--------------------------------------
+- No gamepad on the test PC and the game never polls XInput without one, so tests use keyboard + mouse:
+  Enter-ROFGame goes from a fresh start to the field with save Data 1 (Base): Enter skips the intro; title needs
+  clicks + Enter as a virtual key (retried until the orange LOAD header is detected); a left click = confirm;
+  W/A/S/D = directions ("Load save data?" defaults to No -> W -> click); "Load complete." needs one more click.
+- Window shots: Save-ROFShot. Eye dumps: config DebugDumpEyesAt = N, or F11 with StereoDiag = 1 (also for the
+  user in the headset; F12 always marks the log)
+  (files rofvr_eye_*.bmp in the game folder; 39 MB each at headset size).
+- Upload capture (one frame of constant-buffer uploads): with CameraHook = 1, create rof_upl_now.txt in the game
+  folder -> rof_upl.bin; analyse with tools/upl.py, blk.py, blk2.py from the source snapshot.
+
+CONFIG (config.txt in the game folder; written with comments on first run)
+-------------------------------------------------------------------------
+RenderMode = Native (default) / Flat; ReplayRawFromPass1 = 1 + ReplayPass1Nearest = 1 (flash fix, 0.1.8); ReplayDupFix = 0 (default since 0.1.5 - must stay off in RoF); RenderResolution = Auto / Game / WxH; RenderScale; StereoBothReplay = 1
+(required: 0 breaks the left eye's lighting); PatchAligned = 1; HudLayer / HudDistance / HudWidth / HudOffsetY /
+HudAnchor; HorizonLock = 0 (default for RoF's downward-looking cameras); Foveation Off / Fixed / Gaze;
+Sharpen; MotionBlur = 0. Hotkeys: F8 Flat <-> Native, F9 recentre, F10 HUD panel, Insert menu.
+
+BUILDS
+------
+builds\flat_screen\      0.0.9 flat virtual screen
+builds\native_stereo\    0.1.0 native stereo at the game's own resolution (verified 60 fps)
+builds\headset_res\      0.1.3 native stereo at headset resolution + VRS per-eye fix
+builds\flicker_fix\      0.1.8 + fixes for the one-frame white flashes and the left-eye hair outline
+builds\menu_pad\         0.1.10 + settings menu gamepad: private xinput1_4 copy (Steam Input) - user: works
+builds\release_1.0.0\    1.0.0 INITIAL RELEASE (zip + folder; symbols in xinput1_3.pdb next to the zip) (current)
+
+WHAT TO CHECK IN THE HEADSET (user)
+-----------------------------------
+- Depth looks right (scale, no eye swap); HUD panel placement; comfort of the fixed downward cameras with
+  HorizonLock = 0 vs 1; battles (camera operator) and the world map; cutscenes; fps on the 5090 at 4776x4112.
+- Any remaining one-frame flashes (fixed in 0.1.8: ReplayRawFromPass1; see FINDINGS.md). F12 marks the log.
