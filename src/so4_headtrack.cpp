@@ -23,6 +23,7 @@
 #include <cstring>
 #include <mutex>
 #include "so4_headtrack.h"
+#include "so4_stereo.h"
 #include "xr_runtime.h"
 #include "vrmath.h"
 #include "config.h"
@@ -32,8 +33,13 @@
 namespace so4vr {
 namespace {
 
+#ifdef ROFVR_EE   // Enhanced Edition: same up to +0x5FF; flags +0x118, everything from the lens shift on +0x10 (EE projection builder 0x93620)
+constexpr uintptr_t kWorld = 0x30, kFlags110 = 0x118, kView = 0x120, kShift = 0x660, kAspect = 0x6F4,
+                    kLens = 0x720, kFlags7AB = 0x7BA, kFilmAspect = 0x7D8, kFilmW = 0x7DC, kFilmH = 0x7E0;
+#else
 constexpr uintptr_t kWorld = 0x30, kFlags110 = 0x110, kView = 0x120, kShift = 0x650, kAspect = 0x6E4,
                     kLens = 0x710, kFlags7AB = 0x7AA, kFilmAspect = 0x7C8, kFilmW = 0x7CC, kFilmH = 0x7D0;
+#endif
 constexpr uintptr_t kLensFocal = 0x18, kLensZoom = 0x28, kLensFilmMM = 0x44;
 
 template <typename T> T& At(uintptr_t a) { return *reinterpret_cast<T*>(a); }
@@ -79,7 +85,7 @@ HeadFrame g_hist[kHist]; bool g_histOk[kHist] = {}; int g_histNext = 0; uint64_t
 HeadFrame g_matched{}; bool g_haveMatched = false;
 
 std::atomic<uint64_t> s_skipMenu{0};
-std::atomic<uint64_t> s_applied{0}, s_skipNoPose{0}, s_skipOther{0}, s_viewHook{0}, s_matched{0}, s_unmatched{0}, s_noUpload{0};
+std::atomic<uint64_t> s_poseReplay{0}, s_poseReused{0}, s_applied{0}, s_skipNoPose{0}, s_skipOther{0}, s_viewHook{0}, s_matched{0}, s_unmatched{0}, s_noUpload{0};
 std::atomic<int> s_lastLag{-1};
 std::atomic<uint64_t> s_ambig{0}, s_notNewest{0}, s_inexact{0};
 std::atomic<uint64_t> s_viewNoHead{0}, s_viewHead{0};
@@ -99,6 +105,9 @@ bool So4HtPre(uintptr_t cam) {
     if (!HeadTrackedMode()) return false;
     uint8_t f7ab = At<uint8_t>(cam + kFlags7AB);
     if (f7ab & 0x01) { s_skipOther++; return false; }                 // orthographic
+#ifdef ROFVR_EE
+    { const float* p = reinterpret_cast<const float*>(cam + 0x420); if (std::fabs(p[0]) < 0.05f || (p[11] == 0.f && p[14] == 0.f)) { s_skipOther++; return false; } }
+#endif
     static const float I[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     if (memcmp(reinterpret_cast<void*>(cam + kWorld), I, sizeof I) == 0) { s_skipOther++; return false; } // title/menu default camera
     {   // 2D-menu cameras (title, save slots, camp menu...): unrotated, on the z axis (e.g. at 0,0,-41). Head
@@ -115,7 +124,28 @@ bool So4HtPre(uintptr_t cam) {
     if (zoom == 0 || filmMM == 0 || filmAspect == 0 || filmW == 0 || filmH == 0) { s_skipOther++; return false; }
 
     XrView views[2]; int64_t baseT = 0, poseT = 0;
+#ifdef ROFVR_EE
+    // The EE updates the main camera ~4 times per frame in a burst. Locating the head anew for each gave every
+    // update a slightly different pose; the frame was then rendered with one update's view but presented with
+    // another's pose (replay views came from record +1) -> jitter when turning. One pose per burst instead.
+    {
+        static XrView cv[2]; static int64_t cb = 0, cp = 0; static LARGE_INTEGER last{}; static bool have = false;
+        LARGE_INTEGER now, f; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
+        const double ms = have ? double(now.QuadPart - last.QuadPart) * 1000.0 / double(f.QuadPart) : 1e9;
+        // The camera update also runs INSIDE the eye replays (a job of the frame calls it again: records advance
+        // pass 1 + replays per frame). There it must keep the pose pass 1 rendered with - a fresh locate there
+        // gave the eyes a newer head than the pose the frame is presented with (one frame ahead, test 087-089).
+        if (have && So4StereoInReplay()) { memcpy(views, cv, sizeof cv); baseT = cb; poseT = cp; s_poseReplay++; }
+        else if (ms < 4.0) { memcpy(views, cv, sizeof cv); baseT = cb; poseT = cp; s_poseReused++; }
+        else {
+            if (!XrLocateEyesForGameFrame(views, &baseT, &poseT)) { s_skipNoPose++; return false; }
+            memcpy(cv, views, sizeof cv); cb = baseT; cp = poseT; have = true;
+        }
+        last = now;
+    }
+#else
     if (!XrLocateEyesForGameFrame(views, &baseT, &poseT)) { s_skipNoPose++; return false; }
+#endif
     // Overscan: render (and report) a slightly larger field of view than the lenses show, so that when the
     // compositor turns an older frame to the current head pose there is image instead of black at the edges.
     if (g_config.fovOverscan > 0.0f) {
@@ -162,6 +192,9 @@ bool So4HtPre(uintptr_t cam) {
     At<float>(cam + kShift + 4) = (cy / hh) * filmH * 0.5f * g_config.lensShiftYSign;
     At<uint8_t>(cam + kFlags7AB) = f7ab | 0x22;                      // projection + view dirty
     At<uint8_t>(cam + kFlags110) &= ~0x04;                           // view not valid -> recomputed (head goes in)
+#ifdef ROFVR_EE
+    At<uint8_t>(cam + kFlags7AB) |= 0x22;   // EE: UpdateCamera rebuilds the view only when it is marked dirty (+0x7BA bit 5) - and the projection (bit 1)
+#endif
 
     memcpy(t_headM, g_p.headM, sizeof t_headM);
     {   // diagnostic: does the game camera follow the head? (regression of game-camera yaw steps on head yaw steps)
@@ -221,6 +254,16 @@ const float* So4HtWorldForView(const float* src, float* tmp) {
     return tmp;
 }
 
+#ifdef ROFVR_EE
+// EE: the eye replays read the live camera, which the game thread has moved on by then (next head pose). Each
+// head record keeps a copy of the camera as that update left it; the replays run against that copy.
+struct CamSnap { uint64_t seq; uintptr_t cam; uint8_t b[0x800 - 0x30]; };
+CamSnap g_snaps[16]; std::mutex g_snapM;
+void SaveCamSnap(uintptr_t cam, uint64_t seq) {
+    std::lock_guard<std::mutex> lk(g_snapM);
+    CamSnap& s = g_snaps[seq & 15]; s.seq = seq; s.cam = cam; memcpy(s.b, reinterpret_cast<void*>(cam + 0x30), sizeof s.b);
+}
+#endif
 void So4HtPost(uintptr_t cam) {
     t_src = nullptr;
     // lens back to the game's values (the next tracked frame sets ours again)
@@ -246,6 +289,9 @@ void So4HtPost(uintptr_t cam) {
         g_hist[g_histNext] = g_p.frame; g_histOk[g_histNext] = true;
         g_histNext = (g_histNext + 1) % kHist;
     }
+#ifdef ROFVR_EE
+    SaveCamSnap(cam, g_p.frame.seq);
+#endif
     s_applied++;
 }
 
@@ -281,9 +327,18 @@ static void OnViewAt(const float* v, int slot, unsigned offset, unsigned bytes) 
     // the per-view buffer is re-uploaded up to ~100 times per frame with the same view: only new views count
     // (a repeat of the previous view reuses that view's match, so a still camera keeps matching every frame)
     thread_local float last[2][12]; thread_local bool haveLast[2] = {}, lastOk[2] = {}; thread_local HeadFrame lastHf[2];
+    bool retry = false;
     if (haveLast[slot] && memcmp(last[slot], v, sizeof last[slot]) == 0) {
         if (!lastOk[slot]) {
             g_upRepBad++;
+            // a still view that was first seen before any head record matched it (e.g. the game's fixed camera
+            // while the records were not there yet): look again now and then, or it would never match
+            thread_local unsigned retryN = 0;
+#ifdef ROFVR_EE
+            if ((retryN++ & 15) == 0) retry = true;
+#else
+            (void)retryN;
+#endif
             // A still view that matched no record: it can be another camera that the game is drawing. Check it
             // against the other cameras now and then, so the main-camera pick can follow it.
             thread_local unsigned rep = 0;
@@ -297,18 +352,29 @@ static void OnViewAt(const float* v, int slot, unsigned offset, unsigned bytes) 
                         break;
                     }
             }
+            if (!retry) return;
         } else {
             g_upRepOk++;
             std::lock_guard<std::mutex> lk(g_hm);
             // a view that has not changed for a long time (a camera the game stopped updating) is not this frame's
+#ifdef ROFVR_EE
+            // EE: the main camera is updated ~4 times per frame; a still view's first match goes stale quickly -
+            // match it again against the newest records instead of dropping it
+            if (g_seq - lastHf[slot].seq > 4) { s_staleRepeat++; retry = true; }
+            if (!retry) {
+#else
             if (g_seq - lastHf[slot].seq > 16) { s_staleRepeat++; return; }
+#endif
             t_upMatch = lastHf[slot]; t_upMatchOk = true;
             if (!g_haveMatched || lastHf[slot].seq >= g_matched.seq) { g_matched = lastHf[slot]; g_haveMatched = true; }
             g_renderedTick = GetTickCount64();
+#ifdef ROFVR_EE
+            }
+#endif
         }
-        return;
+        if (!retry) return;
     }
-    memcpy(last[slot], v, sizeof last[slot]); haveLast[slot] = true; lastOk[slot] = false;
+    if (!retry) { memcpy(last[slot], v, sizeof last[slot]); haveLast[slot] = true; lastOk[slot] = false; }
     std::lock_guard<std::mutex> lk(g_hm);
     ++g_upCount;
     // The record whose view is closest (not just the newest within tolerance): when the camera barely moves,
@@ -337,6 +403,7 @@ static void OnViewAt(const float* v, int slot, unsigned offset, unsigned bytes) 
         return;
     }
     ++g_upUnmatched;
+    lastOk[slot] = false;
     if (!g_haveBad) { memcpy(g_upFirstBad, v, sizeof g_upFirstBad); g_haveBad = true; g_badOff = offset; g_badBytes = bytes; }
     for (int i = 0; i < g_cvN; ++i)   // which camera is this? (the head-tracked camera is not the one being rendered)
         if (ViewEq(v, g_cv[i].view)) {
@@ -468,6 +535,9 @@ void So4HtReport(char* buf, unsigned size) {
     { std::lock_guard<std::mutex> lk(g_fbM); n = g_fbN;
       if (n) { slope = g_fbHH > 1e-9 ? g_fbCH / g_fbHH : 0; camDeg = std::sqrt(g_fbCC / n) * 57.29578; headDeg = std::sqrt(g_fbHH / n) * 57.29578; }
       g_fbCH = g_fbHH = g_fbCC = 0; g_fbN = 0; }
+    size_t k0 = size_t(snprintf(buf, size, "pose reused in burst %llu, in replays %llu | ", (unsigned long long)s_poseReused.exchange(0), (unsigned long long)s_poseReplay.exchange(0)));
+    if (k0 >= size) return;
+    buf += k0; size -= unsigned(k0);
     snprintf(buf, size, "SO4 head tracking: applied %llu (view hook %llu), skipped %llu no pose / %llu menu camera / %llu other | frames matched %llu, held %llu, unmatched %llu, last lag %d updates, rendered-camera switches %llu | new views: ambiguous %llu, closest not newest %llu, inexact %llu | game camera vs head yaw: slope %.2f (rms step cam %.3f / head %.3f deg, %llu updates) | views with head %llu, WITHOUT head %llu | stale view matches ignored %llu",
              (unsigned long long)s_applied.exchange(0), (unsigned long long)s_viewHook.exchange(0), (unsigned long long)s_skipNoPose.exchange(0),
              (unsigned long long)s_skipMenu.exchange(0), (unsigned long long)s_skipOther.exchange(0), (unsigned long long)s_matched.exchange(0), (unsigned long long)s_held.exchange(0),
@@ -476,3 +546,15 @@ void So4HtReport(char* buf, unsigned size) {
 }
 
 } // namespace so4vr
+
+#ifdef ROFVR_EE
+namespace so4vr {
+bool So4HtCamSnapshot(uint64_t seq, uintptr_t cam, void* out) {
+    std::lock_guard<std::mutex> lk(g_snapM);
+    const CamSnap& s = g_snaps[seq & 15];
+    if (s.seq != seq || s.cam != cam) return false;
+    memcpy(out, s.b, sizeof s.b);
+    return true;
+}
+}
+#endif

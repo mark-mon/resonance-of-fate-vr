@@ -109,6 +109,8 @@ struct Config {
     bool  replayRawFromPass1 = true;
     bool  replayPass1Nearest = true;   // ... else the object matrices of the clearly closest pass-1 block of the job
     int   replayPass1MaxRows = 0;      // ... whole pass-1 block when at most this many 16-byte rows differ (closest, unambiguous)   // stereo replays: object matrices of per-view blocks from pass 1 (RoF one-frame white surfaces)
+    bool  debugEeProbe = false;        // Enhanced Remaster diagnostics: camera / render thread / memory scan (ee_probe.cpp)
+    int   debugEeWatch = 0;            // ... hardware write watch on the N-th private-memory copy of the camera matrices
     bool  debugSuspendGame = false;    // diagnostic: suspend the game thread while the eye replays run
     bool  debugNoDelta = false;        // diagnostic: no affine-delta patching of matrices (exact copies only)
     bool  replayMapShadow = false;     // RoF: Map(WRITE/NO_OVERWRITE) of a constant buffer gets the game's raw contents back, not our per-eye patch
@@ -116,6 +118,8 @@ struct Config {
     bool  replayCameraGate = false;    // RoF: hold the game thread's camera updates while the two eye replays run (one-frame white surfaces, tests 031-034)
     bool  replayDupFix = false;       // RoF: OFF - the main per-view block is legitimately re-uploaded many times per job with different contents; the SO4 fix replaced them (left-eye hair outline, test 029)
     // (SO4 notes) // stereo: a per-view block re-uploaded within one replay job keeps the job's first copy      // stereo: never apply the camera delta to orthographic clip matrices (shadow cascades)         // diagnostic: thumbnails of every stereo frame for N seconds (so4vr_scan_NN.raw)           // diagnostic: dump N quarter-size left-eye images per replay-view state
+    bool  replayHoldCamera = false;
+    bool  replayLiveRecord = true;    // EE: the frame takes the head record whose view the replays will render    // EE: the main camera is held at the frame record's state while the eyes replay
     bool  replayViewFix = true;       // stereo: per-view blocks the replay builds from a newer head record get this frame's eye matrices
     bool  exactUploadView = true;     // stereo: patch against the exact uploaded view instead of the matched record's      // diagnostic: match a frame to the newest record within tolerance (0.3.3 behaviour)      // experiment: override the game's Present sync interval (-1 = game's own)
     bool  debugRenderAll = false;   // experiment: render size also into the other screen config fields   // experiment: force the swapchain size (DebugSwapSize = WxH)

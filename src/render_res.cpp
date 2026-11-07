@@ -23,10 +23,22 @@
 namespace so4vr {
 namespace {
 
+#ifdef ROFVR_EE
+// Enhanced Edition: SetScreenConfig 0xA1560(cfg, final desc 16 bytes -> +0x2C, scene desc 20 bytes -> +0x3C), screen
+// config object [0x2547AD8] (also the argument of the frame function 0xA1970), rebuild request 0x108A50 sets queue
+// +0x500F1, the render thread rebuilds in 0x1062E0 (from command types 10 / 19)
+constexpr uintptr_t kScreenCfgPtr = 0x2547AD8;
+constexpr uintptr_t kQScreenDirty = 0x500F1;
+constexpr uintptr_t kFinalSize = 0x2C, kSceneSize = 0x3C;
+constexpr size_t kSceneDescBytes = 20;
+constexpr uintptr_t kFnSetScreenConfig = 0xA1560;
+#else
 constexpr uintptr_t kScreenCfgPtr = 0x1716C08;   // ROF (SO4 0xF76C98)
 constexpr uintptr_t kQScreenDirty = 0x500E1;     // ROF (SO4 0x500D1)
 constexpr uintptr_t kFinalSize = 0x28, kSceneSize = 0x38;
+constexpr size_t kSceneDescBytes = 16;
 constexpr uintptr_t kFnSetScreenConfig = 0x28DDD0; // ROF (SO4 0xD1F0)
+#endif
 using FnSetScreenConfig = char(__fastcall*)(void* cfg, const void* fin, const void* scn);
 std::atomic<uintptr_t> g_queue{0};
 ULONGLONG g_start = GetTickCount64();
@@ -97,6 +109,11 @@ void RenderResGameTick() {
     if (*reinterpret_cast<volatile uint8_t*>(q + kQScreenDirty)) return;   // a rebuild is pending already
     const uint16_t* fin = reinterpret_cast<const uint16_t*>(cfg + kFinalSize);
     const uint16_t* scn = reinterpret_cast<const uint16_t*>(cfg + kSceneSize);
+    if (fin[0] < 320 || fin[0] > 8192 || fin[1] < 180 || fin[1] > 8192 || scn[0] < 320 || scn[0] > 8192 || scn[1] < 180 || scn[1] > 8192) {
+        static bool warned = false;   // not the screen config we expect: never write it
+        if (!warned) { warned = true; LOGW("render resolution: screen config at %p looks wrong (final %ux%u scene %ux%u); not changed", (void*)cfg, fin[0], fin[1], scn[0], scn[1]); }
+        return;
+    }
     // The game's own size: whatever is there while we have not changed it (its graphics options can change it).
     if (!g_appliedW || fin[0] != g_appliedW || fin[1] != g_appliedH) { g_origW = fin[0]; g_origH = fin[1]; g_appliedW = g_appliedH = 0; }
     uint32_t w = 0, h = 0;
@@ -105,9 +122,9 @@ void RenderResGameTick() {
     if (fin[0] == w && fin[1] == h && scn[0] == w && scn[1] == h) return;
     if (g_applies >= 64) return;   // safety: never loop
     ++g_applies;
-    uint8_t f[16], s2[16];
+    uint8_t f[16], s2[24] = {};
     memcpy(f, reinterpret_cast<void*>(cfg + kFinalSize), 16);
-    memcpy(s2, reinterpret_cast<void*>(cfg + kSceneSize), 16);
+    memcpy(s2, reinterpret_cast<void*>(cfg + kSceneSize), kSceneDescBytes);
     reinterpret_cast<uint16_t*>(f)[0] = reinterpret_cast<uint16_t*>(s2)[0] = uint16_t(w);
     reinterpret_cast<uint16_t*>(f)[1] = reinterpret_cast<uint16_t*>(s2)[1] = uint16_t(h);
     g_appliedW = want ? w : 0; g_appliedH = want ? h : 0;

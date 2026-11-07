@@ -9,7 +9,9 @@ void So4StereoReport(char* buf, unsigned size);
 // Constant-buffer upload patching while an eye pass runs (render thread).
 bool So4StereoPatching();
 ID3D11DeviceContext* So4StereoGameContext();   // the game device's immediate context (null until known)
-void So4StereoGateWait();   // game thread: wait while the eye replays run (ReplayCameraGate)
+void So4StereoGateWait();
+void So4CamBusyAdd(int d);   // EE: camera updates in progress (game thread)
+bool So4StereoGateHeld();   // game thread: wait while the eye replays run (ReplayCameraGate)
 void So4StereoPatch(void* data, unsigned bytes);
 void So4StereoScanUpload(const void* data, unsigned bytes);   // diagnostic (StereoDiag >= 5)
 void So4StereoBeforeUpload(const void* data, unsigned bytes, unsigned bufferBytes, unsigned offset = 0);

@@ -23,7 +23,13 @@
 namespace so4vr {
 namespace {
 
+#ifdef ROFVR_EE
+constexpr uintptr_t kFnUpdateCamera = 0x94B50;     // Enhanced Edition
+constexpr uintptr_t kCamFlags = 0x7BA, kCamFlags118 = 0x118;
+#else
 constexpr uintptr_t kFnUpdateCamera = 0x2746F0;
+constexpr uintptr_t kCamFlags = 0x7AA;
+#endif
 using UpdateCameraFn = void(__fastcall*)(void* cam);
 UpdateCameraFn o_UpdateCamera = nullptr;
 
@@ -42,8 +48,28 @@ std::atomic<uint64_t> g_presents{0};   // world, view, proj, projNoJit, VP, VPno
 constexpr int kRec = 16;
 CamRec g_rec[kRec]; uint64_t g_recSeq = 0; std::mutex g_recMx;
 
+#ifdef ROFVR_EE
+thread_local uintptr_t t_trackCam = 0; thread_local uint8_t t_f119Bits = 0;
+constexpr uintptr_t kFnCamUpdateWorld = 0x94AD0;   // CCameraCH vt+0x90
+using CamUpdFn = void(__fastcall*)(void*);
+CamUpdFn o_CamUpdateWorld = nullptr;
+void __fastcall hk_CamUpdateWorld(void* cam) {
+    o_CamUpdateWorld(cam);
+    uintptr_t c = reinterpret_cast<uintptr_t>(cam);
+    if (c != t_trackCam) return;
+    const float* w = reinterpret_cast<const float*>(c + 0x30);
+    for (int r = 0; r < 3; ++r) { float n = w[r * 4] * w[r * 4] + w[r * 4 + 1] * w[r * 4 + 1] + w[r * 4 + 2] * w[r * 4 + 2]; if (std::fabs(n - 1.0f) > 1e-3f) return; }
+    uint8_t& f = *reinterpret_cast<uint8_t*>(c + 0x119);
+    t_f119Bits |= uint8_t(f & 3);
+    f = uint8_t(f & ~3);
+}
+#endif
 // View inverse (rigid / scaled), called by UpdateCamera as inv(world @ +0x30) -> view @ +0x120.
+#ifdef ROFVR_EE
+constexpr uintptr_t kFnInvRigid = 0x134A0, kFnInvScaled = 0;   // EE: the scaled inverse is inlined (UpdateCamera +0x119 & 3)
+#else
 constexpr uintptr_t kFnInvRigid = 0x1B9AF0, kFnInvScaled = 0xD50F0;
+#endif
 using InvFn = void(__fastcall*)(const float* src, float* dst);
 InvFn o_InvRigid = nullptr, o_InvScaled = nullptr;
 void __fastcall hk_InvRigid(const float* src, float* dst) { float tmp[16]; o_InvRigid(So4HtWorldForView(src, tmp), dst); }
@@ -54,7 +80,13 @@ void __fastcall hk_InvScaled(const float* src, float* dst) { float tmp[16]; o_In
 struct Cand { uintptr_t cam; uint32_t n; };
 Cand g_cand[16]; int g_nCand = 0; LARGE_INTEGER g_candT0{}, g_qpf{};
 void NoteCandidate(uintptr_t c) {
-    if (*reinterpret_cast<uint8_t*>(c + 0x7AA) & 1) return;                       // orthographic
+    if (*reinterpret_cast<uint8_t*>(c + kCamFlags) & 1) return;                       // orthographic
+#ifdef ROFVR_EE
+    {   // EE: the 2D/UI cameras (m00 2/1280) do not carry the ortho flag: judge by the projection itself
+        const float* p = reinterpret_cast<const float*>(c + 0x420);
+        if (std::fabs(p[0]) < 0.05f || (p[11] == 0.f && p[14] == 0.f)) return;
+    }
+#endif
     const float* w = reinterpret_cast<const float*>(c + 0x30);
     if (w[0] == 1.f && w[5] == 1.f && w[10] == 1.f && w[3] == 0.f && w[7] == 0.f) return;   // default camera at origin
     int i = 0;
@@ -86,17 +118,40 @@ void PickMain() {
     g_main = best; g_nCand = 0; g_candT0 = now;
 }
 
+#ifdef ROFVR_EE
+struct CamBusy { CamBusy() { So4CamBusyAdd(1); } ~CamBusy() { So4CamBusyAdd(-1); } };
+#endif
 void __fastcall hk_UpdateCamera(void* cam) {
+#ifdef ROFVR_EE
     So4StereoGateWait();   // not while the eye replays read the live camera
+    CamBusy busy;          // (the render thread waits for updates in progress before it holds the camera)
+    if (So4StereoGateHeld()) { So4CamBusyAdd(-1); So4StereoGateWait(); So4CamBusyAdd(1); }
+#else
+    So4StereoGateWait();   // not while the eye replays read the live camera
+#endif
     uintptr_t c = reinterpret_cast<uintptr_t>(cam);
     RenderResGameTick();
     NoteCandidate(c);
     PickMain();
+#ifdef ROFVR_EE
+    if (c == g_main.load() && So4HtPre(c)) {
+        // The camera's own update (vt+0x90 = 0x94AD0 -> node update 0x17180) marks the view for the inlined
+        // "scaled" inverse (+0x119 |= 3) although the field camera's world is orthonormal; neither a hook nor a world
+        // swap reaches that path. hk_CamUpdateWorld sends it down the rigid path (0x134A0, hooked) instead and the
+        // bits are put back after the update.
+        t_trackCam = c; t_f119Bits = 0;
+        o_UpdateCamera(cam);
+        t_trackCam = 0;
+        if (t_f119Bits) *reinterpret_cast<uint8_t*>(c + kCamFlags118 + 1) |= t_f119Bits;
+        So4HtPost(c);
+    }
+#else
     if (c == g_main.load() && So4HtPre(c)) { o_UpdateCamera(cam); So4HtPost(c); }
+#endif
     else {
         So4HtIdle(c);
         o_UpdateCamera(cam);
-        if (!(*reinterpret_cast<uint8_t*>(c + 0x7AA) & 1)) So4HtNoteCameraView(c);   // perspective cameras
+        if (!(*reinterpret_cast<uint8_t*>(c + kCamFlags) & 1)) So4HtNoteCameraView(c);   // perspective cameras
     }
     g_calls++;
     if (c == g_main.load()) {
@@ -184,7 +239,10 @@ bool So4CameraInstall() {
     if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) return false;
     bool ok = Hook(reinterpret_cast<void*>(g_base + kFnUpdateCamera), (void*)hk_UpdateCamera, (void**)&o_UpdateCamera, "SO4 UpdateCamera");
     ok = Hook(reinterpret_cast<void*>(g_base + kFnInvRigid), (void*)hk_InvRigid, (void**)&o_InvRigid, "SO4 view inverse (rigid)") && ok;
-    ok = Hook(reinterpret_cast<void*>(g_base + kFnInvScaled), (void*)hk_InvScaled, (void**)&o_InvScaled, "SO4 view inverse (scaled)") && ok;
+#ifdef ROFVR_EE
+    ok = Hook(reinterpret_cast<void*>(g_base + kFnCamUpdateWorld), (void*)hk_CamUpdateWorld, (void**)&o_CamUpdateWorld, "EE camera world update (vt+0x90)") && ok;
+#endif
+    if (kFnInvScaled) ok = Hook(reinterpret_cast<void*>(g_base + kFnInvScaled), (void*)hk_InvScaled, (void**)&o_InvScaled, "SO4 view inverse (scaled)") && ok;
     LOGI("SO4 camera hook %s (code hook test: if the game exits right after this, the exe's anti-tamper rejects code hooks)", ok ? "installed" : "FAILED");
     return ok;
 }

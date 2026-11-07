@@ -1,3 +1,4 @@
+import os
 # Build xref index: for every .pdata function, linear-disassemble; record rip-relative refs and direct calls/jmps.
 import pickle, struct
 from capstone import *
@@ -22,4 +23,4 @@ for b,e in funcs:
             if op.type==X86_OP_MEM and op.mem.base==X86_REG_RIP:
                 refs.append((a,ins.address+ins.size+op.mem.disp-BASE,'m'))
 print(len(funcs),'funcs',len(refs),'refs')
-pickle.dump(refs,open('/home/claude/rofvr/work/refs.pkl','wb'))
+pickle.dump(refs,open(os.environ.get('ROF_REFS','/home/claude/rofvr/work/refs.pkl'),'wb'))

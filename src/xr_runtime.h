@@ -12,6 +12,8 @@ namespace so4vr {
 
 // Called from the Present hook, before the frame goes to the desktop window.
 void XrOnPresent(IDXGISwapChain* sc);
+// Enhanced Edition (D3D12): this frame's image as a D3D11 texture on the bridge device (see d3d12_bridge.cpp).
+void XrOnFrameD3D11(ID3D11Device* dev, ID3D11Texture2D* frame);
 // Called after ResizeBuffers so the XR swapchain is rebuilt at the new size.
 void XrOnResize();
 

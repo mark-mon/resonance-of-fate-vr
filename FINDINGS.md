@@ -135,3 +135,84 @@ Image base at runtime 0x7FF723FE0000 on the test PC (ASLR; all addresses below a
 - User: "this game works great" with 0.1.10 (menu gamepad via the private xinput1_4 copy). 1.0.0 = 0.1.10 +
   tidied default config text (diagnostic keys removed from the template, ReplayRawFromPass1 listed).
   Release zip: builds\release_1.0.0\ResonanceOfFateVR_1.0.0.zip (DLLs, README, licenses).
+
+## Enhanced Edition / Enhanced Remaster (2026-10-29..30, work in progress)
+- New exe (37,080,008 bytes, PE timestamp 1792059323) after the "Enhanced Edition" update. Direct3D 12, imports
+  XINPUT9_1_0 (so the EE build is xinput9_1_0.dll, built with -DROFVR_EE; the 4K/HD build xinput1_3.dll is
+  unchanged and keeps the old behaviour). SteamStub .bind, but .text is plaintext on disk. New compiler; the
+  game classes are the same (~1400 RTTI vtables match the old exe). Old->EE function map: work_ee/fmap.pkl.
+- Stage 1 (done): D3D12 -> D3D11 bridge (d3d12_bridge.cpp): private D3D11 device on the same adapter, shared
+  texture + shared fence, back buffer copied on the game's queue; feeds the existing XR runtime. Flat screen in
+  the headset at 60 fps.
+- EE RVAs: UpdateCamera 0x94B50 (camera layout as before: +0x120 view, +0x420 proj, +0x4E0 VP); render command
+  processor 0x106940; constant upload 0xCC060 (rcx renderer, rdx buffer object, r8 desc {src +0, offset +0xC,
+  size +0x10}; memcpy into the 1 GB UPLOAD ring at 0xCC207); wrapper 0xE34C0(this, slot, size, data).
+- Per-view block (test 069): size 0x8B0 in the EE (0x8A0 before), uploaded from 0xDB783 / 0xDB8E3 (function
+  0xDB51B) on the render thread, ~50,000 per second; the camera view rows are still at +0x340. (A 0x8A0 upload also
+  still exists, ~480 per second.) Found with a hardware write watch on a ring slot (test 068); a CPU-side search for
+  the uploaded bytes matched garbage and flooded the log to 765 MB (removed; the log is now capped at 64 MB).
+- Render thread (tests 072-073): processor 0x106940(q, int*, bool*), packet jump table 0x107410; ring +0xC8
+  (0x2001 x 0x28), read +0xC4, write +0xC0, callback +0x98 (args +0xA0/+0xA8), event +0x88. Type 0 job:
+  call [rax+0x240] at 0x106A8E (FF 90 40 02 00 00); type 4 job2 vt+0x248. Frame submit 0xD09E0 (closes the open
+  list with 0xD0580, ExecuteCommandLists) from 0xA1970 (types 10 / 19); 0x1062E0 is NOT per frame.
+  Renderer global 0x2545A90 -> +0x298C30 device object -> +0x1C28D0 open ID3D12GraphicsCommandList (all of a
+  frame's lists are submitted together at the frame end, so per-eye replays record into the same frame).
+- Gameplay frame ~383 jobs (Base): shadow/depth jobs, scene into a 1280x720 R16G16B16A16F target, post jobs,
+  bloom 320x180, then the COMBINER vt 0x17E8B30 (job fn 0x383F20; old 0xA26790 / 0x3FE150) draws 1 quad into the
+  1280x720 R10G10B10A2 final target, then UI jobs (vt 0x1711090, 0x17119A0, 0x17143E0, 0x17103A0) on top.
+- Camera in the EE: same layout up to +0x5FF; flags +0x118 (old +0x110); from the lens shift on everything +0x10
+  (shift 0x660, aspect 0x6F4, lens* 0x720, flags 0x7BA, film aspect/W/H 0x7D8/0x7DC/0x7E0; projection builder
+  0x93620). Rigid view inverse 0x134A0 (hooked); the scaled inverse is inlined (UpdateCamera +0x119 & 3 path),
+  so for it the head goes into the world matrix around the update. The 2D/UI cameras (vt 0x17E9FE8, m00 2/1280)
+  do NOT carry the ortho flag bit -> rejected by projection (m00 < 0.05 or no perspective terms). The main field
+  camera (CCameraCH vt 0x16EEDD0) is updated ~4x per frame: a still view's match goes stale after 4 records ->
+  re-matched (EE only).
+- Native stereo (test 078, stereo preview 1): the old replay engine (so4_stereo.cpp, #ifdef ROFVR_EE) runs over
+  D3D12: constant uploads patched in a copy at 0xCC060 (ee_render.cpp), eyes copied (barrier RT -> COPY_SOURCE)
+  into shared D3D12 textures inside the engine's own command list after each eye's replay, published at Present
+  through the D3D11 bridge (XrPublishStereo). Every frame stereo, ~56 fps at 1280x720 per eye (replay 4.4 ms,
+  patching 6.1 ms per stereo frame). Jobs flagged for completion (+0x190 bit 19) are never replayed.
+  Not ported yet: HUD layer, render resolution (SetScreenConfig), TAA per-eye history, motion blur skip, VRS.
+
+### EE head tracking / render resolution (tests 079-082, stereo preview 2)
+- User test of preview 1 (Pimax/lighthouse, 3980x3424 recommended): stereo ran, but the image moved with the head and
+  was very blurry. Causes: (1) UpdateCamera rebuilds the view only when +0x7BA bit 5 is set -> So4HtPre sets 0x22;
+  (2) the camera's own world update (CCameraCH vt+0x90 = 0x94AD0 -> node update 0x17180: +0x118 &= 0xE2,
+  +0x119 |= 3) selects the INLINED "scaled" inverse inside UpdateCamera although the world is orthonormal -> the
+  rigid-inverse hook never ran ("views WITHOUT head" ~100%). Fix: hook 0x94AD0; for the tracked camera with an
+  orthonormal world clear +0x119 bits 0-1 after it, restore them after UpdateCamera -> rigid path 0x134A0 (hooked).
+  Test 082: head in every view, fake head sweep turns the image.
+- Render resolution (test 080): SetScreenConfig 0xA1560(cfg [0x2547AD8], final desc 16 bytes -> +0x2C, scene desc
+  20 bytes -> +0x3C); rebuild byte queue +0x500F1 (set by 0x108A50, handled by 0x1062E0). 4808x2704 per eye on the
+  null headset, ~53 fps, eye images sharp.
+- Brightness (user, preview 2): the EE final target is R10G10B10A2_UNORM holding gamma-encoded colour; there is no
+  sRGB variant, so the XR swapchain took it as linear -> far too bright. PickSwapchainFormat maps R10G10B10A2 to
+  R8G8B8A8_UNORM_SRGB (drawn with sRGB decode by the reprojection pass; a plain draw when not reprojecting). Test 083:
+  XR swapchain format 29.
+- HUD (test 083, preview 3): at the combiner the frame's UI commands (until command 3/6/10/19) are replayed twice
+  through the fake queue after ClearRenderTargetView (black / white) of the final target in the engine's list (RTV
+  handle from the OMSetRenderTargets hook); both copied into shared textures (eye slots 2/3), matte built with the
+  4K/HD code (so4_hud) on the bridge's D3D11 device at Present -> HUD quad layer. 4808x2704, ~48-50 fps.
+- Motion blur (EE): job vt 0x17F79B8 (fn 0x10EB740, tests +0x715 & 9 like the old 0x7F58C0 +0x70D & 5), skipped in VR
+  (test 085: skipped every frame).
+- Foveated rendering (EE, tests 084-085): D3D12 VRS tier 2 instead of NVAPI. In the OMSetRenderTargets hook (render
+  thread): scene pass = RT0 at the render size + a DSV -> ID3D12GraphicsCommandList5::RSSetShadingRate(1X1,
+  {PASSTHROUGH, OVERRIDE}) + RSSetShadingRateImage(per-eye R8_UINT image, 16-pixel tiles on the 3080 Ti); other binds
+  and the frame end unbind. Pattern uploaded through an upload buffer + CopyTextureRegion in the engine's list (old
+  buffers released 8 frames later). Test 085 (High): eye corners 100% 4x4-uniform blocks, centre full rate, both eyes;
+  51-55 fps vs 48-50 without.
+- Head-turn jitter (user, preview 4, 90 fps on the Pimax): the main camera is updated ~4x per game frame and So4HtPre
+  located the head for each update -> records of one frame had different poses; the replays rendered record +1..+3
+  views while the frame was presented with record 0's pose ("replay views by record: [0] 0, +1 646908, +2 27944,
+  +3 8160"). EE: the located pose is reused for updates < 4 ms after the previous one (one pose per burst). Test
+  086 (fake head sweep): pose reused ~800 / 5 s, all replay views from one record carrying the frame's pose.
+- Head-turn jitter, real cause (tests 087-091, frame sequence dumps rof_dump_seq.txt -> 40 frames at 1/8 + csv of
+  each frame's record; image shift by phase correlation vs fx * tan(head yaw delta)): the eye images were one head
+  pose AHEAD of the record the frame was presented with (image shift(i) = predicted shift(i+1)). The replays
+  rebuild the per-view block (0xDB51B, CPU block = its rbx argument) from live view data that the game thread has
+  already advanced to its next camera update by then (replay views by record: all +1). Not the camera object
+  (holding it during the replays changed nothing, test 089), and UpdateCamera does not run inside the replays (090).
+  Fix (EE, ReplayLiveRecord = 1): before the replays, read the view rows (+0x340) of the last pass-1 per-view CPU
+  block, find the head record with that view (+1..+8) and make it the frame's record (patch centre, eye matrices,
+  published pose). Test 091: replay views all [0], image motion vs pose rms 0.40 px at 1/8 scale (quantisation).
+  Kept but off: ReplayHoldCamera (089). Pass-1 view restore only applies when the live record was not taken.

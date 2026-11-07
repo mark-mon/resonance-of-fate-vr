@@ -54,7 +54,11 @@ static const char* kDefaultConfig =
     "# Sharpening of the headset image (0.0 = off, 1.0 = strong). Counters TAA softness.\n"
     "Sharpen = 0.0\n"
     "\n"
+#ifdef ROFVR_EE
+    "# --- Foveated rendering (GPUs with Direct3D 12 variable rate shading tier 2: NVIDIA RTX, AMD RX 6000+, Intel Arc) ---\n"
+#else
     "# --- Foveated rendering (NVIDIA RTX GPUs) ---\n"
+#endif
     "# Fixed = shade the outer part of each eye's image at a reduced rate for more fps (centred on each lens).\n"
     "# Gaze  = the full-quality area follows your eyes (headsets with eye tracking; falls back to Fixed).\n"
     "# Off   = full rate everywhere.\n"
@@ -262,12 +266,16 @@ void LoadConfig(const std::wstring& gameDir) {
         else if (EqNoCase(key, "CameraHook"))       g_config.cameraHook = iv;
         else if (EqNoCase(key, "ExactUploadView")) g_config.exactUploadView = bv;
         else if (EqNoCase(key, "ReplayViewFix")) g_config.replayViewFix = bv;
+        else if (EqNoCase(key, "ReplayHoldCamera")) g_config.replayHoldCamera = bv;
+        else if (EqNoCase(key, "ReplayLiveRecord")) g_config.replayLiveRecord = bv;
         else if (EqNoCase(key, "ReplayDupFix")) g_config.replayDupFix = bv;
         else if (EqNoCase(key, "ReplayCameraGate")) g_config.replayCameraGate = bv;
         else if (EqNoCase(key, "ReplayPacketSnapshot")) g_config.replayPacketSnapshot = bv;
         else if (EqNoCase(key, "ReplayMapShadow")) g_config.replayMapShadow = bv;
         else if (EqNoCase(key, "DebugNoDelta")) g_config.debugNoDelta = bv;
         else if (EqNoCase(key, "DebugSuspendGame")) g_config.debugSuspendGame = bv;
+        else if (EqNoCase(key, "DebugEeProbe")) g_config.debugEeProbe = bv;
+        else if (EqNoCase(key, "DebugEeWatch")) g_config.debugEeWatch = iv;
         else if (EqNoCase(key, "ReplayRawFromPass1")) g_config.replayRawFromPass1 = bv;
         else if (EqNoCase(key, "ReplayPass1MaxRows")) g_config.replayPass1MaxRows = iv;
         else if (EqNoCase(key, "ReplayPass1Nearest")) g_config.replayPass1Nearest = bv;

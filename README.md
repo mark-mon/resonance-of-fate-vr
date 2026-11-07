@@ -1,6 +1,6 @@
 # Resonance of Fate VR
 
-A native VR mod for **Resonance of Fate 4K/HD Edition** (Steam). Each eye is rendered by the game with its own
+A native VR mod for **Resonance of Fate** on Steam - both the **Enhanced Edition** (2026 "Enhanced Remaster" update, Direct3D 12) and the older **4K/HD Edition** (Direct3D 11). Each eye is rendered by the game with its own
 camera (true stereo, not alternate-eye rendering), the camera follows your head, the HUD sits on its own panel and
 there is an in-headset settings menu.
 
@@ -12,12 +12,19 @@ there is an in-headset settings menu.
 - **HUD on its own OpenXR layer** (world- or head-anchored), **settings menu** (Dear ImGui via vrkit), fixed in
   space where it opens; works with keyboard and gamepad (also with Steam Input).
 - **Mod reprojection** of every frame to the current head pose (the game is capped at 60 fps).
-- Motion blur off in VR, sharpening, NVIDIA foveated rendering (fixed or eye-tracked).
+- Motion blur off in VR, sharpening, foveated rendering (fixed or eye-tracked; Enhanced Edition: Direct3D 12
+  variable rate shading tier 2 on any vendor, 4K/HD Edition: NVIDIA).
 
 ## Install (players)
-Download the release zip, copy `xinput1_3.dll` and `openxr_loader.dll` next to `Resonance of Fate.exe`, start
-SteamVR, then the game. See [`release/README.txt`](release/README.txt) for controls and settings.
-Requires the Steam version 1.0.0.4 of the game (the mod checks the executable and stays off for other builds).
+Download the release zip and copy the two DLLs from the folder for your edition next to `Resonance of Fate.exe`:
+
+| Edition | Folder in the zip | Files |
+|---|---|---|
+| Enhanced Edition (current Steam version) | `Enhanced Edition\` | `xinput9_1_0.dll`, `openxr_loader.dll` |
+| 4K/HD Edition 1.0.0.4 (2019) | `4K-HD Edition\` | `xinput1_3.dll`, `openxr_loader.dll` |
+
+Start SteamVR, then the game. See [`release/README.txt`](release/README.txt) for controls and settings. Each DLL
+checks the executable and stays off on the other edition.
 
 | Control | |
 |---|---|
@@ -35,6 +42,16 @@ the frame's commands are replayed for the left and the right eye, and every per-
 with that eye's matrices. Object matrices of the replays are taken from pass 1, because other game threads already
 write the next frame's data while the eyes replay (this caused one-frame white flashes). The eye images go to an
 OpenXR projection layer; the HUD is separated with a black/white matte onto its own quad layer.
+
+### Enhanced Edition (Direct3D 12)
+Same source tree, built with `-DROFVR_EE` into `xinput9_1_0.dll` (`scripts/build.sh ee`; `scripts/build.sh hd`
+builds the 4K/HD `xinput1_3.dll`). The game logic is unchanged but the exe was rebuilt with a new compiler and the
+renderer moved to Direct3D 12. A bridge (`src/d3d12_bridge.cpp`) shares textures and a fence with a private D3D11
+device that drives the existing OpenXR code. The replay stereo works over D3D12 as well: the eyes are copied inside
+the engine's own command list (`src/ee_render.cpp`), the constant uploads are patched at the engine's upload
+function, and foveation uses D3D12 VRS tier 2. Because the game thread has already written its next camera update
+by the time the eyes replay, the frame takes the head record the replays actually render (otherwise the eyes are
+one head pose ahead of the pose the frame is shown with - jitter when turning).
 
 Details, addresses and the test history: [`FINDINGS.md`](FINDINGS.md).
 

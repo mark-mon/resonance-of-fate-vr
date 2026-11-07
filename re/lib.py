@@ -1,8 +1,10 @@
 import struct, bisect, re, pefile
 from capstone import *
-BASE=0x7ff723fe0000
+import os
+BASE=int(os.environ.get('ROF_BASE','0x7ff723fe0000'),16)
 class Img:
-    def __init__(s, path='/home/claude/rofvr/work/rof_dump.exe'):
+    def __init__(s, path=None):
+        path = path or os.environ.get('ROF_IMG','/home/claude/rofvr/work/rof_dump.exe')
         s.d=open(path,'rb').read()
         pe=pefile.PE(data=s.d[:0x1000],fast_load=True)
         s.secs=[(x.Name.rstrip(b'\0').decode('latin1'),x.VirtualAddress,x.Misc_VirtualSize) for x in pe.sections]

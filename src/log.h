@@ -4,6 +4,7 @@
 #include <cstdarg>
 #include <mutex>
 #include <share.h>
+#include <cstring>
 
 namespace so4vr {
 
@@ -30,7 +31,15 @@ public:
         snprintf(line, sizeof(line), "[%02u:%02u:%02u.%03u][%5lu][%s] %s\n",
                  t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, GetCurrentThreadId(), level, msg);
         std::lock_guard<std::mutex> lk(mtx());
-        if (file()) { fputs(line, file()); fflush(file()); }
+        if (file()) {
+            // safety cap: a runaway log must never fill the disk (64 MB is far beyond any normal session)
+            static size_t written = 0;
+            if (written < (64u << 20)) {
+                written += strlen(line);
+                fputs(written < (64u << 20) ? line : "[log size limit reached - further lines dropped]\n", file());
+                fflush(file());
+            }
+        }
         OutputDebugStringA(line);
     }
 private:

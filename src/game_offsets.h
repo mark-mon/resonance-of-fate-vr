@@ -21,7 +21,11 @@ constexpr bool kCameraKnown = false;
 constexpr bool kRofCameraMapped = true;    // UpdateCamera 0x2746F0, view inverse 0x1B9AF0 / 0xD50F0, flags +0x7AA
 constexpr bool kRofStereoMapped = true;     // processor 0x2A2FA0, job site 0x2A30C3, frame end 0x28DE80, combiner vt 0xA26790
 // Per-view constant block (renderer +0x26E930 CPU copy, uploaded by 0x295D80 from 0x28FC70; SO4: 2192 bytes)
+#ifdef ROFVR_EE
+constexpr unsigned kViewBlockBytes = 0x8B0;          // Enhanced Edition (test 069: uploaded via 0xE34C0 from 0xDB51B, view rows still at +0x340)
+#else
 constexpr unsigned kViewBlockBytes = 0x8A0;          // 2208
+#endif
 constexpr unsigned kViewPosA = 0xC0, kViewPosB = 0x340;   // camera view rows (SO4 layout; ROF main camera blocks: +0x340, test 020)
 constexpr unsigned kViewPosMain = 0x340;                  // ROF: where the main camera view sits in its per-view blocks
 

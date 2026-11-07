@@ -35,6 +35,9 @@
 #include "render_res.h"
 #include "xr_runtime.h"
 #include "vrmath.h"
+#ifdef ROFVR_EE
+#include "ee_render.h"
+#endif
 #include <d3d11.h>
 #include <dxgi.h>
 #include <string>
@@ -45,11 +48,26 @@ void TallyScan(uint64_t frameSeq);
 uint64_t CtxImmDraws();
 namespace {
 
+#ifdef ROFVR_EE
+// Enhanced Edition: processor 0x106940 (packet jump table 0x107410), type 0 job call [rax+0x240] at 0x106A8E; the frame's
+// command lists are closed and submitted by 0xD09E0 (from 0xA1970, command types 10 / 19) - that is the frame end here
+constexpr uintptr_t kFnProcess = 0x106940, kJobCallSite = 0x106A8E, kFnFrameEnd = 0xD09E0;
+constexpr uint8_t   kJobCallBytes[6] = {0xFF, 0x90, 0x40, 0x02, 0x00, 0x00};
+constexpr int       kJobVt = 0x240 / 8;
+constexpr uintptr_t kQRead = 0xC4, kQWrite = 0xC0, kQRing = 0xC8, kQEntry = 0x28;
+constexpr uintptr_t kQCallback = 0x98, kQEvent = 0x88;   // pending callback (fn, args +0xA0 / +0xA8) and event
+#else
 constexpr uintptr_t kFnProcess = 0x2A2FA0, kJobCallSite = 0x2A30C3, kFnFrameEnd = 0x28DE80;   // ROF (SO4 0x5D910 / 0x5DA3A / 0x0D2E0)
 constexpr uint8_t   kJobCallBytes[6] = {0xFF, 0x90, 0x48, 0x02, 0x00, 0x00};   // ROF: call [rax+0x248]
 constexpr int       kJobVt = 0x248 / 8;
 constexpr uintptr_t kQRead = 0xB4, kQWrite = 0xB0, kQRing = 0xB8, kQEntry = 0x28;   // ROF (SO4 0xA4 / 0xA0 / 0xA8)
+#endif
 constexpr int       kQEntries = 0x2001;
+#ifdef ROFVR_EE
+constexpr bool kIsEe = true;
+#else
+constexpr bool kIsEe = false;
+#endif
 
 uintptr_t g_base = 0;
 using FnJob = void(__fastcall*)(void* obj, void* arg, uint32_t flags);
@@ -66,8 +84,13 @@ int g_prevEnd = -1;
 std::atomic<uint64_t> s_jobs{0}, s_frames{0};
 
 // The final 3D composite job (Aska::PostProcessCombiner); UI jobs (2D, minimap, ...) come after it.
+#ifdef ROFVR_EE
+constexpr uintptr_t kVtCombiner = EE_VT_COMBINER;   // EE PostProcessCombiner (job trace, test 073)
+constexpr uintptr_t kVtMotionBlur = EE_VT_MOTIONBLUR;
+#else
 constexpr uintptr_t kVtCombiner = 0xA26790;   // ROF PostProcessCombiner (SO4 0x90F038)
-constexpr uintptr_t kVtMotionBlur = 0xA48170;   // ROF PostProcessMotionBlur (job fn 0x7F58C0; SO4 0x9296C8)   // camera motion blur job: smears every head movement in VR
+constexpr uintptr_t kVtMotionBlur = 0xA48170;
+#endif   // ROF PostProcessMotionBlur (job fn 0x7F58C0; SO4 0x9296C8)   // camera motion blur job: smears every head movement in VR
 std::atomic<uint64_t> s_mbSkipped{0};
 int g_combinerIdx = -1;            // index of this frame's combiner job (pass 1)
 void OnCombinerDone();             // pass 1, stereo frame: left eye captured here (no UI)
@@ -76,6 +99,9 @@ void OnCombinerDone();             // pass 1, stereo frame: left eye captured he
 int g_traceFrame = 0; bool g_tracing = false; bool g_dumpReq = false;
 void TraceJob(int idx, void* obj, const char* when) {
     if (!g_tracing) return;
+#ifdef ROFVR_EE
+    LOGI("trace %s job %d vt+%llX", when, idx, (unsigned long long)(*reinterpret_cast<uintptr_t*>(obj) - g_base)); return;
+#endif
     ID3D11DeviceContext* ctx = nullptr;
     uintptr_t r = *reinterpret_cast<uintptr_t*>(g_base + 0x1714AC0);
     ID3D11Device* dev = r ? *reinterpret_cast<ID3D11Device**>(r + 0x24A9B8) : nullptr;
@@ -100,7 +126,12 @@ std::atomic<uint64_t> s_jobMismatchFrames{0};
 // thread is already writing later frames while the eyes replay; when it reused this frame's packet memory, part
 // of one eye was drawn with another frame's packets (tests 031-035: one extra per-view upload with the next
 // camera in the glitched eye -> one-frame white surfaces). Pass 1 copies the packets; the replays draw the copies.
-constexpr uintptr_t kFnJobPackets = 0x1EF9A0; constexpr uint32_t kPacketBytes = 0x260;
+#ifdef ROFVR_EE
+constexpr uintptr_t kFnJobPackets = 0x5EF80;   // EE (function map)
+#else
+constexpr uintptr_t kFnJobPackets = 0x1EF9A0;
+#endif
+constexpr uint32_t kPacketBytes = 0x260;
 struct PktSnap { uint32_t off, size; };
 PktSnap g_pkt[kMaxJobs]; std::vector<uint8_t> g_pktArena; size_t g_pktUsed = 0; int g_pktCur = 0;
 std::atomic<uint64_t> s_pktJobs{0}, s_pktChanged{0}, s_pktBytesChanged{0}, s_pktOverflow{0};
@@ -182,6 +213,10 @@ std::atomic<uint64_t> s_offThreadSet{0}; DWORD g_renderTid = 0;
 // in the middle of an eye's replay, that eye drew part of the frame with the next camera (one extra per-view
 // upload in that eye) -> one-frame white surfaces. Camera updates wait while the replays run (ReplayCameraGate).
 std::atomic<bool> g_gate{false};
+std::atomic<int> g_camBusy{0};
+std::atomic<bool> g_gateHeld{false};
+std::atomic<uint64_t> s_camHeld{0}, s_camSame{0}, s_camHoldFail{0}, s_liveRec[5], s_liveRecMiss{0};
+bool g_liveRec = false;
 std::atomic<DWORD> g_gameTid{0}; std::atomic<uint64_t> s_suspends{0};
 std::atomic<uint64_t> s_crossEye{0}, s_ownEye{0}, s_deltaLooseOnly{0}, s_deltaNearMiss{0};
 std::atomic<uint64_t> s_gateWaits{0}, s_gateTimeouts{0}; std::atomic<int64_t> s_gateUs{0};
@@ -201,7 +236,11 @@ void __fastcall hk_SetConstB(void* r, int bit, int idx, const void* src, int cnt
     o_SetConstB(r, bit, idx, src, cnt);
 }
 uint64_t __fastcall hk_Process(void* q, int* counter, uint8_t* flag) {
+#ifdef ROFVR_EE
+    if (!g_inReplay) { g_renderTid = GetCurrentThreadId(); g_queue = reinterpret_cast<uintptr_t>(q); EeNoteRenderThread(g_renderTid); RenderResRenderTick(reinterpret_cast<uintptr_t>(q)); }
+#else
     if (!g_inReplay) { g_renderTid = GetCurrentThreadId(); g_queue = reinterpret_cast<uintptr_t>(q); RenderResRenderTick(reinterpret_cast<uintptr_t>(q)); }
+#endif
     return o_Process(q, counter, flag);
 }
 
@@ -348,6 +387,9 @@ void SetPatchEye(int e) {
 bool IsTitleView(const float* V) { return V[0] == 1.0f && V[5] == 1.0f && V[10] == 1.0f && V[3] == 0.0f && V[7] == 0.0f; }
 
 bool EnsureDevice() {
+#ifdef ROFVR_EE
+    return true;   // EE: eyes are copied through the engine's command list (ee_render / d3d12_bridge)
+#endif
     if (g_ctx) return true;
     uintptr_t r = *reinterpret_cast<uintptr_t*>(g_base + kRendererGlobal);
     if (!r) return false;
@@ -360,6 +402,9 @@ bool EnsureDevice() {
 // The combiner renders the final 3D image into an offscreen target (copied to the back buffer only at frame
 // end): capture whatever is bound as render target 0 right after the combiner job.
 bool CaptureBackBuffer(int e) {
+#ifdef ROFVR_EE
+    return EeCaptureEye(e);
+#endif
     ID3D11Texture2D* bb = nullptr;
     {
         ID3D11RenderTargetView* rtv = nullptr;
@@ -389,6 +434,9 @@ bool CaptureBackBuffer(int e) {
 }
 
 ID3D11Texture2D* BackBuffer() {
+#ifdef ROFVR_EE
+    return nullptr;
+#endif
     uintptr_t r = *reinterpret_cast<uintptr_t*>(g_base + kRendererGlobal);
     IDXGISwapChain* sc = r ? *reinterpret_cast<IDXGISwapChain**>(r + kRendSwapChain) : nullptr;
     ID3D11Texture2D* bb = nullptr;
@@ -415,6 +463,9 @@ void RestoreDesktop() {
 }
 
 void DumpBmp(ID3D11Texture2D* tex, const wchar_t* name, bool alpha = false, UINT step = 1) {
+#ifdef ROFVR_EE
+    if (!g_dev || !tex) return;
+#endif
     D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
     D3D11_TEXTURE2D_DESC sd = d; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
     ID3D11Texture2D* st = nullptr; g_dev->CreateTexture2D(&sd, nullptr, &st);
@@ -478,6 +529,35 @@ extern uint8_t* g_fakeQ;
 // cleared, left eye already copied out) and the pair gives the HUD with real coverage. The right-eye replay
 // that follows rewrites the target, and the game's own UI pass then draws over the right eye (monitor).
 bool CaptureHud() {
+#ifdef ROFVR_EE
+    {   // EE: the frame's UI commands run twice over the cleared final target (black / white) in the engine's own
+        // command list; both images are copied out and the matte is built on the bridge's D3D11 side at Present
+        if (!g_config.hudLayer) return false;
+        uintptr_t q = g_queue.load();
+        if (!q || !g_fakeQ) return false;
+        const int cur = *reinterpret_cast<volatile int*>(q + kQRead);
+        const int wr = *reinterpret_cast<volatile int*>(q + kQWrite);
+        int last = -1, jobs = 0;
+        for (int i = cur, n = 0; n < 4096; ++n) {
+            i = i + 1 < kQEntries ? i + 1 : 0;
+            if (i == wr) break;
+            uint8_t t = *reinterpret_cast<uint8_t*>(q + kQRing + uintptr_t(i) * kQEntry);
+            if (t == 3 || t == 6 || t == 10 || t == 19) { last = i == 0 ? kQEntries - 1 : i - 1; break; }
+            if (t == 0) jobs++;
+        }
+        if (last < 0 || jobs == 0) { s_hudNoEnd++; return false; }
+        for (int bg = 0; bg < 2; ++bg) {
+            if (!EeHudClear(bg)) { s_hudNoRt++; return false; }
+            if (!BuildFakeQueue(cur, last)) return false;
+            g_inReplay = true;
+            int counter = 0; uint8_t flag = 1;
+            o_Process(g_fakeQ, &counter, &flag);
+            g_inReplay = false;
+            if (!EeHudCapture(bg)) return false;
+        }
+        return true;
+    }
+#endif
     uintptr_t q = g_queue.load();
     if (!q || !g_fakeQ) return false;
     const int cur = *reinterpret_cast<volatile int*>(q + kQRead);
@@ -536,6 +616,26 @@ void OnCombinerDone() {
         if (!g_frameReady) return;
         g_frameReady = false;
         if (!PickFrameRecord()) return;
+#ifdef ROFVR_EE
+        // The replays rebuild the per-view block from the game's live view data, which the game thread has
+        // usually moved on to its next camera update by now (next head pose). Measured (test 087-090): the eye
+        // images then show that newer head while the frame was presented with pass 1's record -> jitter when
+        // turning. So the frame takes the record the replays will actually render.
+        g_liveRec = false;
+        if (g_config.replayLiveRecord) if (const uint8_t* blk = EeLastViewBlock()) {
+            float v[12]; bool ok = true;
+            __try { memcpy(v, blk + off::kViewPosB, 48); } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+            auto near12 = [&](const float* r) { for (int j = 0; j < 12; ++j) if (std::fabs(v[j] - r[j]) > 1e-5f * std::fmax(1.0f, std::fabs(v[j]))) return false; return true; };
+            if (ok && !near12(g_hf.view)) {
+                bool found = false;
+                for (int d = 1; d <= 8 && !found; ++d) {
+                    HeadFrame r;
+                    if (So4HtRecordBySeq(g_hf.seq + d, r) && near12(r.view)) { ApplyFrameRecord(r); found = true; g_liveRec = true; s_liveRec[d < 4 ? d : 4]++; }
+                }
+                if (!found) s_liveRecMiss++;
+            } else if (ok) s_liveRec[0]++;
+        }
+#endif
         if (!EnsureDevice()) return;
         g_gate.store(g_config.replayCameraGate);
         HANDLE susp = nullptr;
@@ -545,8 +645,31 @@ void OnCombinerDone() {
             if (susp) s_suspends++;
         }
         { static int lg = 0; if (lg < 3 && g_config.debugSuspendGame) { ++lg; LOGI("suspend game thread: tid %lu -> %s (err %lu)", g_gameTid.load(), susp ? "ok" : "FAILED", GetLastError()); } }
+#ifdef ROFVR_EE
+        // hold the main camera at the state this frame's record left it in (the game thread waits meanwhile)
+        static uint8_t live[0x800 - 0x30], snap[0x800 - 0x30];
+        uintptr_t mc = So4MainCamera(); bool held = false;
+        if (g_config.replayHoldCamera && mc) {
+            g_gate.store(true); g_gateHeld.store(true);
+            LARGE_INTEGER a, b, f; QueryPerformanceCounter(&a); QueryPerformanceFrequency(&f);
+            while (g_camBusy.load(std::memory_order_acquire) > 0) {
+                QueryPerformanceCounter(&b);
+                if ((b.QuadPart - a.QuadPart) * 1000 > f.QuadPart * 8) break;
+                YieldProcessor();
+            }
+            if (g_camBusy.load() == 0 && So4HtCamSnapshot(g_hf.seq, mc, snap)) {
+                memcpy(live, reinterpret_cast<void*>(mc + 0x30), sizeof live);
+                if (memcmp(live, snap, sizeof live)) { memcpy(reinterpret_cast<void*>(mc + 0x30), snap, sizeof snap); held = true; s_camHeld++; }
+                else s_camSame++;
+            } else s_camHoldFail++;
+        }
+#endif
         g_hudBuilt = CaptureHud();
         if (ReplayEye(0)) ReplayEye(1);
+#ifdef ROFVR_EE
+        if (held) memcpy(reinterpret_cast<void*>(mc + 0x30), live, sizeof live);
+        g_gateHeld.store(false);
+#endif
         if (susp) { ResumeThread(susp); CloseHandle(susp); }
         g_gate.store(false);
         return;
@@ -581,17 +704,26 @@ bool RunJobs(int n) {
 // commands of types 0 (jobs), 2 (set render target + clear) and 3 (resolve) up to the combiner.
 constexpr size_t kQSize = 0x50200;   // ROF queue object: ring ends at 0x500E0, fields up to ~0x50110
 uint8_t* g_fakeQ = nullptr;   // (declared above for CaptureHud)
-std::atomic<uint64_t> s_replayCmds{0};
+std::atomic<uint64_t> s_replayCmds{0}, s_replayFlaggedSkip{0}, s_p1ViewFix{0};
 bool BuildFakeQueue(int from, int upto) {
     uintptr_t q = g_queue.load();
     if (!q || !g_fakeQ || from < 0 || upto < 0) return false;
     memcpy(g_fakeQ, reinterpret_cast<void*>(q), kQRing);                  // header fields
+#ifdef ROFVR_EE
+    *reinterpret_cast<uint64_t*>(g_fakeQ + kQCallback) = 0; *reinterpret_cast<uint64_t*>(g_fakeQ + kQEvent) = 0;
+#else
     *reinterpret_cast<uint64_t*>(g_fakeQ + 0x88) = 0;   // ROF (SO4 +0x78)                       // no pending callback
+#endif
     int k = 0;
     for (int i = from; ; ) {
         i = i + 1 < kQEntries ? i + 1 : 0;
         const uint8_t* e = reinterpret_cast<const uint8_t*>(q + kQRing + uintptr_t(i) * kQEntry);
         uint8_t t = e[0];
+#ifdef ROFVR_EE
+        // a job flagged for completion (+0x190 bit 19) is released through the queue's completion list: never twice
+        if (t == 0 && (*reinterpret_cast<const uint32_t*>(*reinterpret_cast<const uintptr_t*>(e + 8) + 0x190) & 0x80000)) { s_replayFlaggedSkip++; }
+        else
+#endif
         if (t == 0 || t == 2 || t == 3) { ++k; memcpy(g_fakeQ + kQRing + uintptr_t(k) * kQEntry, e, kQEntry); }
         if (i == upto || k >= kQEntries - 2) break;
     }
@@ -605,9 +737,11 @@ bool ReplayEye(int eye);
 void ReplayRightEye(int last) { (void)last; ReplayEye(1); }
 bool ReplayEye(int eye) {
     LARGE_INTEGER t0, t1, qf; QueryPerformanceCounter(&t0);
+#ifndef ROFVR_EE   // EE: the per-view block is uploaded per draw (0xE34C0 from 0xDB51B), nothing to mark dirty
     uintptr_t r = *reinterpret_cast<uintptr_t*>(g_base + kRendererGlobal);
     if (r) *reinterpret_cast<uint32_t*>(r + kRendDirty) |= 0x09;   // re-upload the per-view constant blocks
-    if (g_config.debugReplay == 7) {   // diagnostic: magenta back buffer before the replay (what the replay does not draw stays magenta)
+#endif
+    if (g_config.debugReplay == 7 && g_ctx) {   // diagnostic: magenta back buffer before the replay (what the replay does not draw stays magenta)
         if (ID3D11Texture2D* bb = BackBuffer()) {
             ID3D11RenderTargetView* rtv = nullptr;
             D3D11_RENDER_TARGET_VIEW_DESC rd{}; D3D11_TEXTURE2D_DESC d; bb->GetDesc(&d);
@@ -619,7 +753,7 @@ bool ReplayEye(int eye) {
     uintptr_t q = g_queue.load();
     int cur = q ? *reinterpret_cast<volatile int*>(q + kQRead) : -1;   // the combiner command being executed
     if (!BuildFakeQueue(g_prevEnd, cur)) return false;
-    if (g_config.stereoBothReplay) TemporalBeforeEye(g_ctx, eye);   // each eye blends with its own previous frame (TAA etc.)
+    if (g_config.stereoBothReplay && g_ctx) TemporalBeforeEye(g_ctx, eye);   // each eye blends with its own previous frame (TAA etc.)
     g_jobPass = eye + 1; g_jobDiagN[g_jobPass] = 0; g_pktCur = 0; g_jobSeq = 0;
     g_camChangedAt = -1; if (uintptr_t cam = So4MainCamera()) { g_camHash = CamHash(cam); memcpy(g_camRow0, reinterpret_cast<const void*>(cam + 0x4E0), 16); }
     g_inReplay = true;
@@ -629,7 +763,7 @@ bool ReplayEye(int eye) {
     SetPatchEye(-1);
     g_inReplay = false;
     g_jobPass = 0;
-    if (g_config.stereoBothReplay) TemporalAfterEye(g_ctx, eye, true);
+    if (g_config.stereoBothReplay && g_ctx) TemporalAfterEye(g_ctx, eye, true);
     if (eye == 1) {   // compare the jobs' draw counts: pass 1 / left / right
         int n = g_jobDiagN[0]; if (g_jobDiagN[1] < n) n = g_jobDiagN[1]; if (g_jobDiagN[2] < n) n = g_jobDiagN[2];
         int bad = 0;
@@ -726,6 +860,10 @@ bool ReplayEye(int eye) {
     QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&qf);
     g_replayMs += double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(qf.QuadPart); g_replayN++;
     if (!CaptureBackBuffer(eye)) return false;
+#ifdef ROFVR_EE
+    if (eye == 1) { EeStereoReady(g_hf, g_hudBuilt); s_stereo++; g_stereoThisFrame = true; g_hudBuilt = false; if (g_traceFrame < 900) g_traceFrame++; }
+    return true;
+#endif
     if (eye == 1) {
         if (!g_config.hudLayer && g_hudBuilt) {   // HudLayer = 0: the HUD goes into both eye images (flat, at screen depth)
             for (int e = 0; e < 2; ++e) {
@@ -880,6 +1018,9 @@ void __fastcall hk_FrameEnd(void* self) {
         }
     }
     g_stereoThisFrame = false;
+#ifdef ROFVR_EE
+    EeBeforeSubmit();
+#endif
     o_FrameEnd(self);
 }
 
@@ -915,7 +1056,7 @@ bool So4StereoInstall() {
     g_fakeQ = static_cast<uint8_t*>(VirtualAlloc(nullptr, kQSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     bool ok = Hook(reinterpret_cast<void*>(g_base + kFnProcess), (void*)hk_Process, (void**)&o_Process, "SO4 render command processor");
     ok = Hook(reinterpret_cast<void*>(g_base + kFnFrameEnd), (void*)hk_FrameEnd, (void**)&o_FrameEnd, "SO4 frame end") && ok;
-    if (g_config.debugGlitchDetect) {
+    if (g_config.debugGlitchDetect && !kIsEe) {
         Hook(reinterpret_cast<void*>(g_base + 0x294FF0), (void*)hk_SetConstA, (void**)&o_SetConstA, "constant setter A (diagnostic)");
         Hook(reinterpret_cast<void*>(g_base + 0x295A90), (void*)hk_SetConstB, (void**)&o_SetConstB, "constant setter B (diagnostic)");
     }
@@ -923,6 +1064,8 @@ bool So4StereoInstall() {
     return ok;
 }
 
+void So4CamBusyAdd(int d) { g_camBusy.fetch_add(d, std::memory_order_acq_rel); }
+bool So4StereoGateHeld() { return g_gateHeld.load(std::memory_order_acquire); }
 void So4StereoGateWait() {
     if (!g_gameTid.load(std::memory_order_relaxed)) g_gameTid = GetCurrentThreadId();
     if (!g_gate.load(std::memory_order_acquire) || GetCurrentThreadId() == g_renderTid) return;
@@ -1204,6 +1347,13 @@ void So4StereoPatchImpl(void* data, unsigned bytes) {
             else if (bestDist < 0) {}
             else if (bestDist == 0) s_p1Exact++;
             else { memcpy(d8, g_p1b[best].b, 0x70); s_p1Fixed++; }
+#ifdef ROFVR_EE
+            // EE: the replay rebuilds the per-view block from the game camera as it is at replay time - by then the
+            // game thread has run its next camera updates (next head pose) -> the eyes showed a newer head than the
+            // pose the frame is presented with (head-turn jitter, test 087). The matched pass-1 block's view rows are
+            // this frame's: use them too.
+            if (best >= 0 && !g_liveRec && memcmp(d8 + 0x340, g_p1b[best].b + 0x340, 0x30)) { memcpy(d8 + 0x340, g_p1b[best].b + 0x340, 0x30); s_p1ViewFix++; }
+#endif
         }
     }
     if (bytes == off::kViewBlockBytes && g_inReplay && g_patchEye < 2 && g_config.replayDupFix) {
@@ -1361,7 +1511,7 @@ void So4StereoReport(char* buf, unsigned size) {
         k = strlen(buf);
     }
     if (k + 2 < size) { buf[k++] = '\n'; buf[k] = 0; So4HudReport(buf + k, unsigned(size - k));
-        k = strlen(buf); snprintf(buf + k, size - k, ", no UI end %llu, no target %llu | pass-1 object matrices: %llu replaced, %llu whole blocks, %llu nearest, %llu exact, %llu unmatched, overflow %llu | camera VP changed mid-replay L %llu R %llu (of %llu checks) | game thread suspended %llu | camera gate: %llu waits (%.1f ms total), %llu timeouts | eye-patched raw matrices: other eye %llu, own eye %llu | delta tolerance: %llu only with the relative test, %llu near misses | packets: %llu replayed jobs, %llu changed since pass 1 (%llu KB), overflow %llu", (unsigned long long)s_hudNoEnd.exchange(0), (unsigned long long)s_hudNoRt.exchange(0), (unsigned long long)s_p1Fixed.exchange(0), (unsigned long long)s_p1Partial.exchange(0), (unsigned long long)s_p1Nearest.exchange(0), (unsigned long long)s_p1Exact.exchange(0), (unsigned long long)s_p1NoMatch.exchange(0), (unsigned long long)s_p1Overflow.exchange(0), (unsigned long long)s_camChanged[0].exchange(0), (unsigned long long)s_camChanged[1].exchange(0), (unsigned long long)s_camChecked.exchange(0), (unsigned long long)s_suspends.exchange(0),
+        k = strlen(buf); snprintf(buf + k, size - k, ", no UI end %llu, no target %llu | pass-1 object matrices: %llu replaced, %llu whole blocks, %llu nearest, %llu exact, %llu unmatched, overflow %llu, pass-1 views restored %llu, camera held %llu / unchanged %llu / failed %llu, live record same %llu +1 %llu +2 %llu +3 %llu more %llu miss %llu | camera VP changed mid-replay L %llu R %llu (of %llu checks) | game thread suspended %llu | camera gate: %llu waits (%.1f ms total), %llu timeouts | eye-patched raw matrices: other eye %llu, own eye %llu | delta tolerance: %llu only with the relative test, %llu near misses | packets: %llu replayed jobs, %llu changed since pass 1 (%llu KB), overflow %llu", (unsigned long long)s_hudNoEnd.exchange(0), (unsigned long long)s_hudNoRt.exchange(0), (unsigned long long)s_p1Fixed.exchange(0), (unsigned long long)s_p1Partial.exchange(0), (unsigned long long)s_p1Nearest.exchange(0), (unsigned long long)s_p1Exact.exchange(0), (unsigned long long)s_p1NoMatch.exchange(0), (unsigned long long)s_p1Overflow.exchange(0), (unsigned long long)s_p1ViewFix.exchange(0), (unsigned long long)s_camHeld.exchange(0), (unsigned long long)s_camSame.exchange(0), (unsigned long long)s_camHoldFail.exchange(0), (unsigned long long)s_liveRec[0].exchange(0), (unsigned long long)s_liveRec[1].exchange(0), (unsigned long long)s_liveRec[2].exchange(0), (unsigned long long)s_liveRec[3].exchange(0), (unsigned long long)s_liveRec[4].exchange(0), (unsigned long long)s_liveRecMiss.exchange(0), (unsigned long long)s_camChanged[0].exchange(0), (unsigned long long)s_camChanged[1].exchange(0), (unsigned long long)s_camChecked.exchange(0), (unsigned long long)s_suspends.exchange(0),
                  (unsigned long long)s_gateWaits.exchange(0), double(s_gateUs.exchange(0)) / 1000.0, (unsigned long long)s_gateTimeouts.exchange(0), (unsigned long long)s_crossEye.exchange(0), (unsigned long long)s_ownEye.exchange(0), (unsigned long long)s_deltaLooseOnly.exchange(0), (unsigned long long)s_deltaNearMiss.exchange(0), (unsigned long long)s_pktJobs.exchange(0), (unsigned long long)s_pktChanged.exchange(0), (unsigned long long)(s_pktBytesChanged.exchange(0) >> 10), (unsigned long long)s_pktOverflow.exchange(0)); }
     if (g_config.replayRawFromPass1) { size_t k2 = strlen(buf); int w = snprintf(buf + k2, size - k2, "\n  unmatched replay blocks, rows differing from pass 1:");
         for (int r = 0; r < 140 && w > 0; ++r) if (g_umRows[r]) { k2 = strlen(buf); if (k2 + 16 < size) w = snprintf(buf + k2, size - k2, " +%X:%u", r * 16, g_umRows[r]); g_umRows[r] = 0; } }

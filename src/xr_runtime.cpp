@@ -440,6 +440,9 @@ DXGI_FORMAT PickSwapchainFormat(DXGI_FORMAT src) {
     DXGI_FORMAT preferred = src;
     if (src == DXGI_FORMAT_R8G8B8A8_UNORM) preferred = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     if (src == DXGI_FORMAT_B8G8R8A8_UNORM) preferred = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    // Enhanced Edition: the final image is R10G10B10A2_UNORM, also gamma-encoded, and there is no sRGB variant of
+    // it: submitted as is the compositor takes it as linear (far too bright). It is drawn into an 8-bit sRGB swapchain.
+    if (src == DXGI_FORMAT_R10G10B10A2_UNORM) preferred = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     if (has(preferred)) return preferred;
     if (has(src)) {
         if (!g_warnedFormat) { LOGW("runtime has no sRGB variant of format %d; colours may look washed out", src); g_warnedFormat = true; }
@@ -980,6 +983,12 @@ void SubmitOneFrame() {
                                                    meta.hf.eyeFov[e], dstEye[e], srgbDst, e == 1);
                         if (ok) s_reprojected++;
                         else { useMod = false; g_xrContext->CopyResource(g_images[idx].texture, g_xs.tex[slot]); }
+                    } else if (meta.stereo && g_scSwapFormat != g_xs.format) {   // format conversion needs a draw (no reprojection)
+                        const UINT ew = g_scWidth / 2;
+                        for (int e = 0; e < 2; ++e)
+                            g_reproj.DrawRect(g_xrContext, g_xs.tex[slot], g_images[idx].texture, g_scSwapFormat, e * ew, ew, g_scHeight,
+                                              e * 0.5f, 0.5f, meta.hf.eyeFov[e], meta.hf.eyePose[e].orientation,
+                                              meta.hf.eyeFov[e], meta.hf.eyePose[e].orientation, srgbDst, e == 1);
                     } else if (useMod && g_reproj.Draw(g_xrContext, g_xs.tex[slot], g_images[idx].texture, g_scSwapFormat,
                                                 g_scWidth, g_scHeight, meta.hf.fov, meta.hf.pose.orientation,
                                                 meta.hf.fov, curPose.orientation, srgbDst)) {
@@ -1148,8 +1157,9 @@ const float* ViewForThisFrame() {
     return RenderedView();
 }
 
-bool StartXr(IDXGISwapChain* sc) {
-    if (!sc || FAILED(sc->GetDevice(__uuidof(ID3D11Device), (void**)&g_gameDevice)) || !g_gameDevice) {
+bool StartXr(IDXGISwapChain* sc, ID3D11Device* dev = nullptr) {
+    if (dev) { g_gameDevice = dev; dev->AddRef(); }   // Enhanced Edition: the D3D12 bridge's D3D11 device
+    else if (!sc || FAILED(sc->GetDevice(__uuidof(ID3D11Device), (void**)&g_gameDevice)) || !g_gameDevice) {
         LOGE("could not get the game's D3D11 device from the swapchain");
         return false;
     }
@@ -1190,10 +1200,13 @@ bool PublishHud(int slot, ID3D11Texture2D* hud) {
     return true;
 }
 
-void XrOnPresent(IDXGISwapChain* sc) {
+void XrOnPresentImpl(IDXGISwapChain* sc, ID3D11Device* bridgeDev, ID3D11Texture2D* bridgeFrame);
+void XrOnPresent(IDXGISwapChain* sc) { XrOnPresentImpl(sc, nullptr, nullptr); }
+void XrOnFrameD3D11(ID3D11Device* dev, ID3D11Texture2D* frame) { XrOnPresentImpl(nullptr, dev, frame); }
+void XrOnPresentImpl(IDXGISwapChain* sc, ID3D11Device* bridgeDev, ID3D11Texture2D* bridgeFrame) {
     if (!g_config.vrOutput || g_initFailed) return;
     if (!g_threadStarted.exchange(true)) {
-        if (!StartXr(sc)) { g_initFailed = true; return; }
+        if (!StartXr(sc, bridgeDev)) { g_initFailed = true; return; }
     }
 
     VrsEndOfFrame(g_gameContext);
@@ -1213,7 +1226,8 @@ void XrOnPresent(IDXGISwapChain* sc) {
     ID3D11Texture2D* back = nullptr;
     ID3D11Texture2D* monoFrame = NativeTakeMonoFrame();
     if (mono && monoFrame) { back = monoFrame; back->AddRef(); }
-    else if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back)) || !back) return;
+    else if (bridgeFrame) { back = bridgeFrame; back->AddRef(); }
+    else if (!sc || FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back)) || !back) return;
     D3D11_TEXTURE2D_DESC bd{};
     back->GetDesc(&bd);
     if (bd.SampleDesc.Count != 1 || !EnsureSharedSet(bd.Width, bd.Height, bd.Format)) { back->Release(); return; }

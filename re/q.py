@@ -1,7 +1,8 @@
+import os
 import pickle, sys, collections
 from lib import *
 I=Img()
-refs=pickle.load(open('/home/claude/rofvr/work/refs.pkl','rb'))
+refs=pickle.load(open(os.environ.get('ROF_REFS','/home/claude/rofvr/work/refs.pkl'),'rb'))
 by_t=collections.defaultdict(list)
 for a,t,k in refs: by_t[t].append((a,k))
 def x(t):

@@ -39,8 +39,14 @@ BOOL CALLBACK LoadReal(PINIT_ONCE, PVOID, PVOID*) {
     UINT n = GetSystemDirectoryW(path, MAX_PATH);
     if (n == 0 || n > MAX_PATH - 32) return TRUE;
     std::wstring dir(path);
+#ifdef ROFVR_EE
+    g_real = LoadLibraryW((dir + L"\\xinput9_1_0.dll").c_str());   // Enhanced Remaster: the game imports xinput9_1_0
+    const char* which = "xinput9_1_0.dll";
+    if (!g_real) { g_real = LoadLibraryW((dir + L"\\xinput1_3.dll").c_str()); which = "xinput1_3.dll"; }
+#else
     g_real = LoadLibraryW((dir + L"\\xinput1_3.dll").c_str());
     const char* which = "xinput1_3.dll";
+#endif
     if (!g_real) { g_real = LoadLibraryW((dir + L"\\xinput1_4.dll").c_str()); which = "xinput1_4.dll"; }
     if (!g_real) { LOGE("failed to load system xinput1_3.dll / xinput1_4.dll (err %lu)", GetLastError()); return TRUE; }
     p_GetState        = (PFN_GetState)GetProcAddress(g_real, "XInputGetState");

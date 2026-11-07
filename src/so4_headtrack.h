@@ -20,6 +20,7 @@ bool So4HtPeekFrame(HeadFrame& out);
 // The oldest head record newer than `seq` (the frame after a rendered one, as a guess before its view upload).
 bool So4HtRecordAfter(uint64_t seq, HeadFrame& out);
 bool So4HtRecordBySeq(uint64_t seq, HeadFrame& out);
+bool So4HtCamSnapshot(uint64_t seq, uintptr_t cam, void* out);   // EE: camera bytes +0x30..+0x7FF after that update
 void So4HtRequestRecenter();
 bool So4HtRecenterRef(float& yaw, XrVector3f& pos);
 void So4HtReport(char* buf, unsigned size);
