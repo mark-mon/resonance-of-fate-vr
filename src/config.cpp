@@ -147,6 +147,7 @@ void LoadConfig(const std::wstring& gameDir) {
         LOGI("config.txt not found, writing defaults");
         FILE* w = nullptr;
         if (_wfopen_s(&w, path.c_str(), L"w") == 0 && w) { fputs(kDefaultConfig, w); fclose(w); }
+        g_config.activeMode = g_config.renderMode;   // (the first start ran in Flat before 1.1.0)
         return;
     }
     char buf[512];

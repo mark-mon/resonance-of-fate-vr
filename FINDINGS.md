@@ -216,3 +216,10 @@ Image base at runtime 0x7FF723FE0000 on the test PC (ASLR; all addresses below a
   block, find the head record with that view (+1..+8) and make it the frame's record (patch centre, eye matrices,
   published pose). Test 091: replay views all [0], image motion vs pose rms 0.40 px at 1/8 scale (quantisation).
   Kept but off: ReplayHoldCamera (089). Pass-1 view restore only applies when the live record was not taken.
+
+## 1.1.0 release (2026-11-06)
+- User: preview 6 "works great". Release zip with one folder per edition: Enhanced Edition\ (xinput9_1_0.dll 1.1.0)
+  and 4K-HD Edition\ (the unchanged 1.0.0 xinput1_3.dll - the old edition can no longer be tested).
+- Smoke test 092 with a fresh config.txt found that the first start (config.txt written with defaults) ran in Flat:
+  LoadConfig returned before activeMode = renderMode. Fixed (093: stereo + HUD at 4808x2704 from the first start).
+  The shipped 1.0.0 HD DLL keeps that bug (README notes it).

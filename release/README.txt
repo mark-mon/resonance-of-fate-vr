@@ -53,6 +53,8 @@ KNOWN LIMITS
 - Tested mainly in the field / Base areas. Battles, the world map and cutscenes have had less testing -
   please report problems with rofvr.log.
 - SteamVR may keep showing an older app name it remembered for this game; that is cosmetic.
+- 4K/HD Edition (unchanged 1.0.0 DLL): the very first start, when config.txt is created, runs on the flat
+  screen - press F8 or restart the game. Fixed in the Enhanced Edition DLL.
 
 CREDITS / LICENSES
 Dear ImGui (MIT), MinHook (BSD 2-Clause), Khronos OpenXR loader (Apache 2.0) - see the licenses folder.
